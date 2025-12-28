@@ -29,6 +29,7 @@ const wsCopy = qs('#wsCopy');
 const wsCommand = qs('#wsCommand');
 const wsCurrent = qs('#wsCurrent');
 const gitTagEl = qs('#gitTag');
+const btnCopyBranch = qs('#btnCopyBranch');
 // Dev Tools
 const btnDevTools = qs('#btnDevTools');
 const devModal = qs('#devModal');
@@ -37,6 +38,8 @@ const devClose = qs('#devClose');
 const devCopy = qs('#devCopy');
 const devRefresh = qs('#devRefresh');
 const devTailToggle = qs('#devTailToggle');
+const devKeepStrictToggle = qs('#devKeepStrictToggle');
+const devExecInChatToggle = qs('#devExecInChatToggle');
 let devTailTimer = null;
 
 const colPlanned = qs('#col-planned');
@@ -50,6 +53,9 @@ const tabDiff = qs('#tab-diff');
 const tabLogs = qs('#tab-logs');
 const tabTests = qs('#tab-tests');
 const tabPlan = qs('#tab-plan');
+const planBody = qs('#planBody');
+const btnPlanToggle = qs('#btnPlanToggle');
+let showPlanRaw = false;
 const tabMemory = qs('#tab-memory');
 const btnPreviewDiff = qs('#btnPreviewDiff');
 const diffModal = qs('#diffModal');
@@ -57,12 +63,26 @@ const modalBody = qs('#modalBody');
 const modalClose = qs('#modalClose');
 const modalCopy = qs('#modalCopy');
 const modalFileSelect = qs('#modalFileSelect');
+const modalFilter = qs('#modalFilter');
 const kanbanStatusEl = qs('#kanbanStatus');
 const btnReapplyCard = qs('#btnReapplyCard');
 const modalRevertFile = qs('#modalRevertFile');
 const modalReapplyFile = qs('#modalReapplyFile');
 let statusTimer = null;
 let statusStart = 0;
+let modalLastSelectedPath = '__all__';
+let modalRawAll = '';
+let modalRawFiles = [];
+let keepRegionsStrict = true;
+let noPendingNoticeShown = false;
+let execInChat = false;
+
+try {
+  const pref = localStorage.getItem('vibe.keepStrict');
+  if (pref === '0') keepRegionsStrict = false;
+  const eic = localStorage.getItem('vibe.execInChat');
+  execInChat = eic === '1';
+} catch {}
 function startStatus(text) {
   if (!kanbanStatusEl) return;
   statusStart = Date.now();
@@ -78,6 +98,19 @@ function stopStatus() {
   if (statusTimer) clearInterval(statusTimer);
   statusTimer = null;
   if (kanbanStatusEl) kanbanStatusEl.classList.remove('loading');
+}
+function refreshIdleStatus() {
+  try {
+    const total = (plan?.tasks || []).length;
+    const done = (plan?.tasks || []).filter(t => t.status === STATUS.DONE || t.status === STATUS.REVERTED).length;
+    const pending = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED).length;
+    if (!kanbanStatusEl) return;
+    if (pending === 0 && done > 0) {
+      kanbanStatusEl.textContent = 'All tasks complete ✓';
+    } else if (pending === 0 && done === 0) {
+      kanbanStatusEl.textContent = 'Idle — ready for next instruction';
+    }
+  } catch {}
 }
 // Chat history for agent context
 let chatHistory = [];
@@ -132,7 +165,7 @@ function addMessage({ who, text }) {
   wrap.className = `msg ${who}`;
   const whoEl = document.createElement('div');
   whoEl.className = 'who';
-  whoEl.textContent = who === 'user' ? 'You' : 'Agent';
+  whoEl.textContent = who === 'user' ? 'You' : (who === 'system' ? 'Execution' : 'Agent');
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.textContent = text;
@@ -278,6 +311,7 @@ function selectTab(name) {
   });
   qsa('.tab-panel').forEach(p => p.classList.remove('active'));
   qs(`#tab-${name}`).classList.add('active');
+  lastSelectedTab = name;
 }
 
 function setEvidence({ taskId, diff, logs, tests }) {
@@ -431,9 +465,35 @@ function v1Dispatch(action) {
 
 function renderPlanJson() {
   try {
-    tabPlan.textContent = plan ? JSON.stringify(plan, null, 2) : 'No plan.';
-  } catch { tabPlan.textContent = 'No plan.'; }
+    if (!planBody) return;
+    if (!plan || !Array.isArray(plan.tasks)) { planBody.textContent = 'No plan.'; return; }
+    if (showPlanRaw) {
+      planBody.textContent = JSON.stringify(plan, null, 2);
+      if (btnPlanToggle) btnPlanToggle.textContent = 'View summary';
+    } else {
+      planBody.textContent = buildPlanSummary(plan);
+      if (btnPlanToggle) btnPlanToggle.textContent = 'View raw JSON';
+    }
+  } catch { if (planBody) planBody.textContent = 'No plan.'; }
 }
+function buildPlanSummary(p) {
+  try {
+    const tasks = Array.isArray(p.tasks) ? p.tasks : [];
+    const parts = [];
+    parts.push(`Plan Summary`);
+    parts.push(`${tasks.length} task(s)`);
+    const maxShow = 6;
+    for (let i=0;i<Math.min(tasks.length,maxShow);i++) {
+      const t = tasks[i];
+      const status = String(t.status || '').toLowerCase();
+      const mark = status==='done' ? '✓' : status==='blocked' ? '⚠' : status==='executing' ? '…' : '•';
+      parts.push(`${mark} ${t.title || t.description || 'Task'}`);
+    }
+    if (tasks.length > maxShow) parts.push(`(+${tasks.length - maxShow} more…)`);
+    return parts.join('\n');
+  } catch { return 'Plan Summary'; }
+}
+btnPlanToggle?.addEventListener('click', () => { showPlanRaw = !showPlanRaw; renderPlanJson(); });
 
 // Fake tools
 const fakeTools = {
@@ -641,7 +701,7 @@ btnReset.addEventListener('click', () => {
 });
 
 // Tabs UI
-tabButtons.forEach(btn => btn.addEventListener('click', () => selectTab(btn.dataset.tab)));
+tabButtons.forEach(btn => btn.addEventListener('click', () => { lastTabClickTs = Date.now(); lastSelectedTab = btn.dataset.tab; selectTab(btn.dataset.tab); }));
 
 // Diff Preview Modal
 function openDiffModal() {
@@ -663,14 +723,15 @@ function openDiffModal() {
       }
       modalFileSelect.onchange = () => {
         const sel = modalFileSelect.value;
-        if (sel === '__all__') { modalBody.textContent = combined; return; }
-        const f = files.find(x => x.path === sel);
-        modalBody.textContent = f ? (f.diff || '(no diff)') : combined;
+        modalLastSelectedPath = sel;
+        applyModalFilter(sel);
       };
-      modalFileSelect.value = '__all__';
+      modalFileSelect.value = files.some(f => f.path === modalLastSelectedPath) ? modalLastSelectedPath : '__all__';
     }
   } catch {}
-  modalBody.textContent = combined;
+  modalRawAll = combined;
+  modalRawFiles = files;
+  applyModalFilter(modalFileSelect ? modalFileSelect.value : '__all__');
   diffModal.classList.remove('hidden');
   diffModal.setAttribute('aria-hidden', 'false');
   // focus content for keyboard scroll
@@ -707,6 +768,21 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+function applyModalFilter(sel) {
+  const q = (modalFilter && modalFilter.value) ? String(modalFilter.value) : '';
+  const src = sel === '__all__' ? modalRawAll : ((modalRawFiles.find(x => x.path === sel) || {}).diff || modalRawAll);
+  if (!q) { modalBody.textContent = src; return; }
+  const lines = String(src).split(/\r?\n/);
+  const low = q.toLowerCase();
+  const out = lines.filter(l => l.toLowerCase().includes(low));
+  modalBody.textContent = out.join('\n') || '(no matches)';
+}
+
+modalFilter?.addEventListener('input', () => {
+  const sel = modalFileSelect ? modalFileSelect.value : '__all__';
+  applyModalFilter(sel);
+});
+
 // Modal file-level revert/reapply handlers
 modalRevertFile?.addEventListener('click', async () => {
   const t = tasks.find(x => x.id === selectedTaskId);
@@ -721,8 +797,8 @@ modalRevertFile?.addEventListener('click', async () => {
     const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
     v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `revert-file: ${sel}${warn}`, tests: 'N/A', files: v3Evidence[selectedTaskId]?.files || [] };
     updateEvidence(selectedTaskId, tasks.find(x => x.id === selectedTaskId)?.status || STATUS.DONE);
-    addMessage({ who: 'agent', text: `Event: Reverted file ${sel} (snapshot ${snap}).` });
-  } catch (e) { addMessage({ who: 'agent', text: `Revert file failed: ${String(e)}` }); }
+    addMessage({ who: 'system', text: `♻️ Reverted file ${sel} (snapshot ${snap}).` });
+  } catch (e) { addMessage({ who: 'system', text: `❌ Revert file failed: ${String(e)}` }); }
 });
 modalReapplyFile?.addEventListener('click', async () => {
   const t = tasks.find(x => x.id === selectedTaskId);
@@ -737,8 +813,8 @@ modalReapplyFile?.addEventListener('click', async () => {
     const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
     v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `reapply-file: ${sel}${warn}`, tests: 'N/A', files: v3Evidence[selectedTaskId]?.files || [] };
     updateEvidence(selectedTaskId, tasks.find(x => x.id === selectedTaskId)?.status || STATUS.DONE);
-    addMessage({ who: 'agent', text: `Event: Reapplied file ${sel} (snapshot ${snap}).` });
-  } catch (e) { addMessage({ who: 'agent', text: `Reapply file failed: ${String(e)}` }); }
+    addMessage({ who: 'system', text: `♻️ Reapplied file ${sel} (snapshot ${snap}).` });
+  } catch (e) { addMessage({ who: 'system', text: `❌ Reapply file failed: ${String(e)}` }); }
 });
 
 // Autopilot toggle
@@ -789,6 +865,7 @@ btnRevertCard?.addEventListener('click', async () => {
     try {
       const chk = await apiPost('/api/revert/check', { snapshotId: snap, direction: 'before' });
       const warns = Array.isArray(chk.warnings) ? chk.warnings : [];
+      try { await v6Log('REVERT_CHECK', { snapshotId: snap, direction: 'before', warnings: warns }); } catch {}
       if (warns.length) {
         const msg = 'The following files have diverged since this card was applied and may be overwritten:\n' + warns.map(w => ` - ${w.path}`).join('\n') + '\n\nProceed with revert?';
         const go = confirm(msg);
@@ -799,7 +876,7 @@ btnRevertCard?.addEventListener('click', async () => {
     const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
     v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `revert: ${res.snapshotId}${warn}`, tests: 'N/A' };
     updateEvidence(selectedTaskId, t.status);
-    addMessage({ who: 'agent', text: `Event: Reverted card "${t.title}" (snapshot ${snap}).` });
+    addMessage({ who: 'system', text: `♻️ Reverted card "${t.title}" (snapshot ${snap}).` });
     try { v3Dispatch({ action: 'UPDATE_TASK', taskId: t.id, status: STATUS.REVERTED, notes: 'Reverted' }); } catch {}
     try { const pt = (plan?.tasks || []).find(x => x.taskId === t.id); if (pt) pt.status = STATUS.REVERTED; } catch {}
     try { const lt = tasks.find(x => x.id === t.id); if (lt) lt.status = STATUS.REVERTED; } catch {}
@@ -809,7 +886,7 @@ btnRevertCard?.addEventListener('click', async () => {
     try { await apiPost('/api/event', { type: 'REVERT', data: { snapshotId: snap, taskId: selectedTaskId, title: t.title } }); } catch {}
     try { await v6FetchAndRender(); } catch {}
   } catch (e) {
-    addMessage({ who: 'agent', text: `Revert failed: ${String(e)}` });
+    addMessage({ who: 'system', text: `❌ Revert failed: ${String(e)}` });
   }
 });
 
@@ -826,6 +903,7 @@ btnReapplyCard?.addEventListener('click', async () => {
     try {
       const chk = await apiPost('/api/revert/check', { snapshotId: snap, direction: 'after' });
       const warns = Array.isArray(chk.warnings) ? chk.warnings : [];
+      try { await v6Log('REVERT_CHECK', { snapshotId: snap, direction: 'after', warnings: warns }); } catch {}
       if (warns.length) {
         const msg = 'The following files differ from the snapshot-before and may be overwritten by reapply:\n' + warns.map(w => ` - ${w.path}`).join('\n') + '\n\nProceed with reapply?';
         const go = confirm(msg);
@@ -836,11 +914,11 @@ btnReapplyCard?.addEventListener('click', async () => {
     const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
     v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `reapply: ${res.snapshotId}${warn}`, tests: 'N/A' };
     updateEvidence(selectedTaskId, t.status);
-    addMessage({ who: 'agent', text: `Event: Reapplied card "${t.title}" (snapshot ${snap}).` });
+    addMessage({ who: 'system', text: `♻️ Reapplied card "${t.title}" (snapshot ${snap}).` });
     try { v3Dispatch({ action: 'UPDATE_TASK', taskId: t.id, status: STATUS.DONE, notes: 'Reapplied' }); } catch {}
     try { await apiPost('/api/event', { type: 'REAPPLY', data: { snapshotId: snap, taskId: t.id, title: t.title } }); } catch {}
   } catch (e) {
-    addMessage({ who: 'agent', text: `Reapply failed: ${String(e)}` });
+    addMessage({ who: 'system', text: `❌ Reapply failed: ${String(e)}` });
   }
 });
 
@@ -910,6 +988,16 @@ chatForm.addEventListener('submit', (e) => {
       }
   } else if (mode === 'V7') {
       addMessage({ who: 'user', text });
+      // If a Needs Input card exists, treat this message as the answer; mark Done and log event
+      try {
+        const need = (plan?.tasks || []).find(t => t.status === STATUS.NEEDS_INPUT);
+        if (need) {
+          try { v6Log('ANSWER', { taskId: need.taskId, answer: text, question: need.title }); } catch {}
+          need.status = STATUS.DONE;
+          v1NormalizeTasksFromPlan();
+          renderPlanJson();
+        }
+      } catch {}
       // Orchestrator: delegate to agent to decide plan/replan/proceed/halt
       v7Chat(text);
   }
@@ -939,6 +1027,16 @@ try { subtitleEl.textContent = 'Latest — Real Planning + Controlled Execution'
   } catch {}
 })();
 
+btnCopyBranch?.addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/ping');
+    const data = await res.json();
+    const branch = data.gitBranch || '';
+    if (!branch) { addMessage({ who: 'agent', text: 'No Git branch detected.' }); return; }
+    try { await navigator.clipboard.writeText(branch); addMessage({ who: 'agent', text: `Copied branch: ${branch}` }); } catch { addMessage({ who: 'agent', text: `Branch: ${branch}` }); }
+  } catch (e) { addMessage({ who: 'agent', text: 'Unable to read Git branch.' }); }
+});
+
 // Change workspace modal controls
 function openWsModal() {
   wsModal.classList.remove('hidden');
@@ -959,6 +1057,8 @@ function openDevModal() {
   devModal.setAttribute('aria-hidden', 'false');
   fetchDebugLogs();
   if (devTailToggle?.checked) startDevTail();
+  if (devKeepStrictToggle) devKeepStrictToggle.checked = !!keepRegionsStrict;
+  if (devExecInChatToggle) devExecInChatToggle.checked = !!execInChat;
 }
 function closeDevModal() {
   devModal.classList.add('hidden');
@@ -980,6 +1080,14 @@ devModal?.addEventListener('click', (e) => { if (e.target && e.target.getAttribu
 devRefresh?.addEventListener('click', fetchDebugLogs);
 devCopy?.addEventListener('click', async () => { try { await navigator.clipboard.writeText(devBody.textContent || ''); } catch {} });
 devTailToggle?.addEventListener('change', () => { if (devTailToggle.checked) startDevTail(); else stopDevTail(); });
+devKeepStrictToggle?.addEventListener('change', () => {
+  keepRegionsStrict = !!devKeepStrictToggle.checked;
+  try { localStorage.setItem('vibe.keepStrict', keepRegionsStrict ? '1' : '0'); } catch {}
+});
+devExecInChatToggle?.addEventListener('change', () => {
+  execInChat = !!devExecInChatToggle.checked;
+  try { localStorage.setItem('vibe.execInChat', execInChat ? '1' : '0'); } catch {}
+});
 
 function startDevTail() {
   stopDevTail();
@@ -994,12 +1102,18 @@ function stopDevTail() {
 // ========== V7 Agent (real LLM planning) ==========
 async function v7Chat(text) {
   try {
-    startStatus('Thinking…');
+    startStatus(deriveThinkingLabel());
     const clientState = buildClientState();
     const out = await apiPost('/api/agent/chat', { text, history: chatHistory.slice(-10), client: clientState });
     const message = out.message || '...';
-    addMessage({ who: 'agent', text: message });
     const actions = Array.isArray(out.actions) ? out.actions : [];
+    const types = new Set(actions.map(a => a && a.type).filter(Boolean));
+    const isAsk = types.has('ASK_INPUT');
+    const isPlanOrProceed = types.has('EMIT_PLAN') || types.has('REPLAN') || types.has('PROCEED_EXECUTION');
+    const hasToolWrites = actions.some(a => a && (a.type==='CREATE_FILE' || a.type==='UPDATE_FILE' || a.type==='EDIT_DIFF'));
+    const isQuestion = (message || '').trim().endsWith('?');
+    const shouldSpeak = isAsk || (!isPlanOrProceed && !hasToolWrites) || isQuestion;
+    if (shouldSpeak) addMessage({ who: 'agent', text: message });
     if (!actions.length) {
       messageOnlyTurns += 1;
       if (kanbanStatusEl && messageOnlyTurns >= 2) { stopStatus(); kanbanStatusEl.textContent = 'Waiting for agent actions…'; }
@@ -1026,8 +1140,23 @@ async function v7Chat(text) {
         btnAutopilot?.classList.remove('on');
         if (btnAutopilot) btnAutopilot.textContent = 'Autopilot: Off';
       } else if (a.type === 'ASK_INPUT') {
-        // Render as chat; optionally hook into Kanban if a.taskId present
-        // For now, leave as chat-only prompt (the message already contains the question)
+        // Create a Needs Input task in Kanban and pause execution on it (executor skips NEEDS_INPUT)
+        const question = String(a.question || message || 'Answer required');
+        const t = { taskId: uuid(), title: `Answer: ${question}`, status: STATUS.NEEDS_INPUT, steps: [], notes: '' };
+        if (!plan) plan = { planId: uuid(), goal: '', tasks: [] };
+        plan.tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+        plan.tasks.push(t);
+        v1NormalizeTasksFromPlan();
+        renderPlanJson();
+        try { await v6Log('ASK_INPUT', { question }); } catch {}
+      }
+    }
+    // Post-processor: add a concise action summary to make chat useful
+    if (actions.length) {
+      const kinds = new Set(actions.map(a => a && a.type).filter(Boolean));
+      if (kinds.has('ASK_INPUT')) {
+        const summary = summarizeActionsForChat(actions);
+        if (summary) addMessage({ who: 'system', text: summary });
       }
     }
     // No actions → likely a clarification question
@@ -1044,6 +1173,163 @@ async function v7Chat(text) {
     // Avoid adding non-LLM chat on errors
     stopStatus();
   }
+}
+
+function summarizeActionsForChat(actions) {
+  try {
+    // Extract plan tasks (titles, writes, diff files)
+    const emit = actions.find(a => a && (a.type === 'EMIT_PLAN' || a.type === 'REPLAN') && a.plan);
+    const titles = emit && Array.isArray(emit.plan?.tasks) ? emit.plan.tasks.slice(0, 5).map(t => String(t.title||'Task')) : [];
+    const fileSet = new Set();
+    if (emit && Array.isArray(emit.plan?.tasks)) {
+      for (const t of emit.plan.tasks) {
+        if (Array.isArray(t.writes)) for (const w of t.writes) if (w?.path) fileSet.add(String(w.path));
+        if (typeof t.diff === 'string') {
+          const lines = t.diff.split(/\r?\n/);
+          for (const ln of lines) {
+            if (ln.startsWith('+++ ')) { const m = ln.match(/^\+\+\+\s+(?:b\/)?(.+)$/); if (m && m[1]) fileSet.add(m[1]); }
+          }
+        }
+      }
+    }
+    // Direct file actions
+    for (const a of actions) {
+      if (!a) continue;
+      if ((a.type === 'CREATE_FILE' || a.type === 'UPDATE_FILE') && a.path) fileSet.add(String(a.path));
+    }
+    // Build message
+    const files = Array.from(fileSet).slice(0, 5);
+    const hasProceed = actions.some(a => a && a.type === 'PROCEED_EXECUTION');
+    const hasHalt = actions.some(a => a && a.type === 'HALT_EXECUTION');
+    const planPart = titles.length ? `Planned ${emit.plan.tasks.length} task(s): ${titles.join('; ')}` : null;
+    const filePart = files.length ? `Files: ${files.join(', ')}` : null;
+    const nextPart = hasProceed ? 'Next: executing tasks.' : (hasHalt ? 'Next: paused.' : null);
+    const parts = [];
+    if (planPart) parts.push(`Summary: ${planPart}`);
+    if (filePart) parts.push(filePart);
+    if (nextPart) parts.push(nextPart);
+    const msg = parts.join('\n');
+    if (msg.trim()) return msg;
+    // Fallback: list action types
+    const kinds = actions.map(a => a && a.type).filter(Boolean);
+    if (kinds.length) return `Summary: ${kinds.join(', ')}`;
+    return '';
+  } catch { return ''; }
+}
+
+function deriveThinkingLabel() {
+  try {
+    const hasPlan = !!(plan && Array.isArray(plan.tasks) && plan.tasks.length);
+    const pending = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED).length;
+    const needs = (plan?.tasks || []).some(t => t.status === STATUS.NEEDS_INPUT);
+    if (!hasPlan) return 'Thinking: creating plan…';
+    if (needs) return 'Thinking: awaiting input…';
+    if (pending > 0) return 'Thinking: proposing next change…';
+    return 'Thinking…';
+  } catch { return 'Thinking…'; }
+}
+
+function buildRunSummaryHTML(patchRes, runRes, task) {
+  try {
+    const files = Array.isArray(patchRes?.changes) ? patchRes.changes.map(c => c.path) : [];
+    const snap = patchRes?.snapshotId || 'n/a';
+    const ok = !!runRes?.ok;
+    const testSummary = ok ? 'pass' : 'fail';
+    const name = String(task?.title || 'Task');
+    const head = `Execution — ${name} • Changed: ${files.length} • Snapshot: ${snap} • Tests: ${testSummary}`;
+    const fileList = files.slice(0, 6).map(p => `<code>${escapeHtml(p)}</code>`).join(', ');
+    const extraFiles = files.length > 6 ? ` (+${files.length - 6} more)` : '';
+    const stdout = String(runRes?.stdout || '').split(/\r?\n/).slice(0, 8).join('\n');
+    const details = `\n<details><summary>Execution log</summary>\n<div style="margin-top:6px">\n  <div>Files: ${fileList}${extraFiles}</div>\n  <div>Snapshot: <code>${escapeHtml(snap)}</code></div>\n  <div>Tests:</div>\n  <pre class="code" style="white-space:pre-wrap">${escapeHtml(stdout)}</pre>\n</div>\n</details>`;
+    return `${escapeHtml(head)}${details}`;
+  } catch {
+    return `Execution — ${escapeHtml(String(task?.title || 'Task'))}`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Render an Execution summary bubble (safe DOM building; no raw HTML)
+function addExecutionSummary(patchRes, runRes, task) {
+  try {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg system';
+    const whoEl = document.createElement('div');
+    whoEl.className = 'who';
+    whoEl.textContent = 'Execution';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+
+    // Header
+    const header = document.createElement('div');
+    const title = String(task?.title || 'Task');
+    const changes = Array.isArray(patchRes?.changes) ? patchRes.changes : [];
+    const created = changes.filter(c => c.type === 'added').map(c => c.path);
+    const edited = changes.filter(c => c.type === 'modified').map(c => c.path);
+    const deleted = changes.filter(c => c.type === 'deleted').map(c => c.path);
+    const headParts = [`Execution — ${title}`];
+    if (created.length) headParts.push(`Created: ${created.slice(0,2).join(', ')}${created.length>2?` (+${created.length-2})`:''}`);
+    if (edited.length) headParts.push(`Edited: ${edited.slice(0,2).join(', ')}${edited.length>2?` (+${edited.length-2})`:''}`);
+    if (deleted.length) headParts.push(`Deleted: ${deleted.slice(0,2).join(', ')}${deleted.length>2?` (+${deleted.length-2})`:''}`);
+    headParts.push(`Tests: ${runRes?.ok ? 'pass' : 'fail'}`);
+    header.textContent = headParts.join(' • ');
+
+    // Inline (log) expander
+    const details = document.createElement('details');
+    details.style.display = 'inline';
+  const summary = document.createElement('summary');
+  summary.textContent = ' (details)';
+    summary.style.display = 'inline';
+    summary.style.marginLeft = '6px';
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.style.marginTop = '6px';
+
+    // Files list (limit)
+    const filesLine = document.createElement('div');
+  const allFiles = changes.map(c => c.path);
+  // Filter out .gitkeep noise
+  const filterFiles = allFiles.filter(p => !/\.gitkeep$/i.test(p));
+  const filesToShow = filterFiles.length ? filterFiles : allFiles;
+  const maxShow = 6;
+  filesLine.appendChild(document.createTextNode('Files: '));
+  for (let i=0;i<Math.min(filesToShow.length,maxShow);i++) {
+    const code = document.createElement('code'); code.textContent = filesToShow[i];
+    filesLine.appendChild(code);
+    if (i<Math.min(filesToShow.length,maxShow)-1) filesLine.appendChild(document.createTextNode(', '));
+  }
+  if (filesToShow.length>maxShow) filesLine.appendChild(document.createTextNode(` (+${filesToShow.length-maxShow} more)`));
+
+    // Snapshot with Copy
+    const snapLine = document.createElement('div');
+    const snapLbl = document.createElement('span'); snapLbl.textContent = 'Snapshot: ';
+    const snap = patchRes?.snapshotId || 'n/a';
+    const snapCode = document.createElement('code'); snapCode.textContent = String(snap);
+  const copyBtn = document.createElement('button'); copyBtn.textContent='Copy id'; copyBtn.className='mini-copy'; copyBtn.title='Copy snapshot id';
+    copyBtn.addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(String(snap)); }catch{} });
+    snapLine.appendChild(snapLbl); snapLine.appendChild(snapCode); snapLine.appendChild(document.createTextNode(' ')); snapLine.appendChild(copyBtn);
+
+    // Tests output (first 8 lines)
+    const testsHdr = document.createElement('div'); testsHdr.textContent = 'Tests:';
+    const pre = document.createElement('pre'); pre.className = 'code'; pre.style.whiteSpace='pre-wrap';
+    pre.textContent = String(runRes?.stdout || '').split(/\r?\n/).slice(0,8).join('\n');
+
+    body.appendChild(filesLine);
+    body.appendChild(snapLine);
+    body.appendChild(testsHdr);
+    body.appendChild(pre);
+    details.appendChild(body);
+
+    bubble.appendChild(header);
+    bubble.appendChild(details);
+    wrap.appendChild(whoEl);
+    wrap.appendChild(bubble);
+    chatMessagesEl.appendChild(wrap);
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  } catch {}
 }
 
 function buildClientState() {
@@ -1084,6 +1370,8 @@ async function v7SetPlan(newPlan, provider) {
     addMessage({ who: 'agent', text: 'Received invalid plan from agent.' });
     return;
   }
+  noPendingNoticeShown = false;
+  try { currentRunId = newPlan.planId || uuid(); wrapUpSentRunId = null; } catch {}
   // Merge behavior: prefer identity by taskId; do not merge by title
   if (prevPlan && Array.isArray(prevPlan.tasks) && prevPlan.tasks.length) {
     const merged = { planId: prevPlan.planId || newPlan.planId || uuid(), goal: newPlan.goal || prevPlan.goal || '', tasks: [] };
@@ -1126,6 +1414,7 @@ async function v7SetPlan(newPlan, provider) {
     if (btnAutopilot) btnAutopilot.textContent = 'Autopilot: On';
     latestRunQueue();
   }
+  refreshIdleStatus();
 }
 async function v7Start(goal) {
   try {
@@ -1164,6 +1453,11 @@ async function latestApplyPatchForTask(task) {
       const m2 = String(st).match(/\bmkdir\s+['"]?([^'"\n]+)['"]?/i);
       if (m2) stepPaths.push(norm(m2[1]) + '/.gitkeep');
     }
+  }
+
+  // If the plan includes a unified diff, apply it via diff endpoint
+  if (typeof task.diff === 'string' && task.diff.trim()) {
+    return postPatchDiff({ diff: String(task.diff), keepRegions: !!keepRegionsStrict });
   }
 
   // If the plan includes explicit writes (path + content), honor them verbatim
@@ -1257,20 +1551,42 @@ async function postPatch(body, tries = 6, delayMs = 250) {
   return await apiPost('/api/patch', body);
 }
 
+async function postPatchDiff(body, tries = 6, delayMs = 250) {
+  for (let i = 0; i < tries; i++) {
+    try { return await apiPost('/api/patch/diff', body); }
+    catch (e) {
+      const msg = String(e || '');
+      if (msg.includes('HTTP 423')) { await new Promise(r => setTimeout(r, delayMs)); continue; }
+      throw e;
+    }
+  }
+  return await apiPost('/api/patch/diff', body);
+}
+
 async function latestRunQueue() {
   if (!v5Autopilot) return;
   clearTimers();
-  const queue = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED);
+  const all = (plan?.tasks || []);
+  const waitingInput = all.filter(t => t.status === STATUS.NEEDS_INPUT);
+  const queue = all.filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED && t.status !== STATUS.NEEDS_INPUT);
   if (!queue.length) {
-    if (kanbanStatusEl) kanbanStatusEl.textContent = 'No pending tasks to execute.';
-    addMessage({ who: 'agent', text: 'No pending tasks. I need to propose update tasks before I can apply a fix.' });
+    if (waitingInput.length) {
+      if (kanbanStatusEl) kanbanStatusEl.textContent = 'Waiting for input…';
+      // keep chat clean; status is enough
+    } else {
+      if (kanbanStatusEl) kanbanStatusEl.textContent = 'No pending tasks to execute.';
+    }
+    refreshIdleStatus();
+    try { await maybeSendRunWrapUp(); } catch {}
     return;
   }
+  noPendingNoticeShown = false;
   const t = queue[0];
   v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.EXECUTING, notes: 'Applying patch' });
   startStatus('Applying patch…');
+  let patchRes;
   try {
-    const patchRes = await latestApplyPatchForTask(t);
+    patchRes = await latestApplyPatchForTask(t);
     if (patchRes && patchRes.snapshotId) {
       if (!Array.isArray(v3Snapshots[t.taskId])) v3Snapshots[t.taskId] = [];
       v3Snapshots[t.taskId].push(patchRes.snapshotId);
@@ -1283,10 +1599,12 @@ async function latestRunQueue() {
     const fileDiffs = changed.map(c => ({ path: c.path, type: c.type, diff: c.diff || '' }));
     v3Evidence[t.taskId] = { diff: patchRes.diff || '(no diff)', logs, tests: 'Ready to run tests', files: fileDiffs };
     v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.VERIFYING, notes: 'Running tests' });
+    // keep chat lean; summarize after tests
   } catch (e) {
     v3Evidence[t.taskId] = { diff: 'Patch failed.', logs: String(e), tests: '' };
     v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED });
     if (kanbanStatusEl) { kanbanStatusEl.textContent = 'Patch failed'; stopStatus(); }
+    addMessage({ who: 'system', text: `❌ Patch failed: ${String(e).slice(0,180)}` });
     return;
   }
   try {
@@ -1297,16 +1615,110 @@ async function latestRunQueue() {
     if (ok) {
       v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.DONE, notes: 'Completed' });
       if (kanbanStatusEl) { kanbanStatusEl.textContent = ''; stopStatus(); }
+      if (execInChat) addExecutionSummary(patchRes, runRes, t);
+      // Auto-switch Evidence tab to Plan; skip if user recently focused Diff
+      try {
+        const recent = Date.now() - (lastTabClickTs || 0) < 8000;
+        if (!(recent && lastSelectedTab === 'diff')) selectTab('plan');
+      } catch {}
       schedule(200, latestRunQueue);
     } else {
       v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED, notes: 'Tests failed' });
       if (kanbanStatusEl) { kanbanStatusEl.textContent = 'Tests failed'; stopStatus(); }
+      addExecutionSummary(patchRes, runRes, t); // always show on failure
     }
   } catch (e) {
     v3Evidence[t.taskId] = { diff: v3Evidence[t.taskId]?.diff || '', logs: 'Error running tests', tests: String(e), files: v3Evidence[t.taskId]?.files || [] };
     v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED });
     if (kanbanStatusEl) { kanbanStatusEl.textContent = 'Error running tests'; stopStatus(); }
+    addExecutionSummary(patchRes, { ok: false, stdout: String(e) }, t);
   }
+}
+
+async function postRunWrapUp(task, patchRes, runRes) {
+  const changes = Array.isArray(patchRes?.changes) ? patchRes.changes.map(c => ({ path: c.path, type: c.type })) : [];
+  const lastUser = chatHistory.slice().reverse().find(m => m.role === 'user' && (m.content||'').trim().length>0);
+  const goal = lastUser ? lastUser.content.trim() : (plan?.goal || '');
+  const summary = {
+    goal,
+    task: task?.title || '',
+    changes,
+    tests: { ok: !!runRes?.ok, brief: !!runRes?.ok ? 'pass' : String(runRes?.stdout||'').split(/\r?\n/)[0] || 'fail' },
+    snapshotId: patchRes?.snapshotId || ''
+  };
+  try {
+    const res = await apiPost('/api/wrapup', { summary });
+    const msg = (res && res.message) ? String(res.message) : '';
+    if (msg) addMessage({ who: 'agent', text: msg });
+  } catch {
+    const names = changes.slice(0,3).map(c=>c.path).join(', ');
+    const ok = !!runRes?.ok;
+    const fallback = ok
+      ? `Done — ${task?.title || 'task'}. Files: ${names || 'none'}. Want to make another change?`
+      : `Tests failed in ${task?.title || 'task'}. I can show failing output or revert; what should I do?`;
+    addMessage({ who: 'agent', text: fallback });
+  }
+}
+
+// ----- Run wrap-up (once at end of plan) -----
+let currentRunId = null; // updated when setting a new plan
+let wrapUpSentRunId = null;
+
+async function maybeSendRunWrapUp() {
+  if (!plan || !Array.isArray(plan.tasks) || plan.tasks.length === 0) return;
+  const pending = (plan.tasks || []).filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED).length;
+  if (pending > 0) return;
+  const rid = currentRunId || plan.planId || plan.goal || 'run';
+  if (wrapUpSentRunId === rid) return;
+  const summary = aggregateRunSummary();
+  if (!summary) return;
+  try {
+    const res = await apiPost('/api/wrapup', { summary });
+    const msg = (res && res.message) ? String(res.message) : '';
+    if (msg) addMessage({ who: 'agent', text: msg });
+  } catch {
+    const names = (summary.primaryFiles || []).join(', ');
+    const ok = !!(summary.tests && summary.tests.ok);
+    const fallback = ok
+      ? `Done — ${summary.task || 'task'}. Files: ${names || 'none'}. Want to make another change?`
+      : `Tests failed. I can show failing output or revert — what should I do?`;
+    addMessage({ who: 'agent', text: fallback });
+  }
+  wrapUpSentRunId = rid;
+}
+
+function aggregateRunSummary() {
+  try {
+    const all = [];
+    for (const t of (plan?.tasks || [])) {
+      const ev = v3Evidence[t.taskId];
+      if (ev && Array.isArray(ev.files)) {
+        for (const f of ev.files) all.push({ path: f.path, type: f.type });
+      }
+    }
+    const prio = { deleted: 3, added: 2, modified: 1 };
+    const byPath = new Map();
+    for (const c of all) {
+      if (!c || !c.path) continue;
+      const prev = byPath.get(c.path);
+      if (!prev || (prio[String(c.type)||''] > prio[String(prev.type)||''])) byPath.set(c.path, { path: c.path, type: c.type });
+    }
+    let files = Array.from(byPath.values());
+    const meaningful = files.filter(x => !/\.gitkeep$/i.test(x.path));
+    if (meaningful.length) files = meaningful;
+    const primaryFiles = files.slice(0, 3).map(x => x.path);
+    const anyBlocked = (plan.tasks || []).some(t => t.status === STATUS.BLOCKED);
+    const task = (plan.tasks || []).slice(-1)[0]?.title || '';
+    const lastUser = chatHistory.slice().reverse().find(m => m.role === 'user' && (m.content||'').trim().length>0);
+    const goal = lastUser ? lastUser.content.trim() : (plan?.goal || '');
+    let lastSnap = '';
+    for (const t of (plan.tasks || []).slice().reverse()) {
+      const arr = v3Snapshots[t.taskId];
+      const s = Array.isArray(arr) ? arr[arr.length-1] : arr;
+      if (s) { lastSnap = s; break; }
+    }
+    return { goal, task, changes: files, primaryFiles, tests: { ok: !anyBlocked }, snapshotId: lastSnap };
+  } catch { return null; }
 }
 
 function v2CreatePlan(goal) {
@@ -1902,7 +2314,9 @@ function renderMemory() {
   lines.push(`# Memory Summary`);
   lines.push(`Preferred style: ${lastStyle || 'unknown'}`);
   const revs = v6Events.filter(e => e.type === 'REVERT').length;
+  const checks = v6Events.filter(e => e.type === 'REVERT_CHECK').length;
   lines.push(`Reverts: ${revs}`);
+  lines.push(`Revert checks: ${checks}`);
   lines.push('');
   lines.push(`# Recent Events`);
   const recent = v6Events.slice(-20);
@@ -1914,8 +2328,11 @@ function renderMemory() {
     else if (e.type === 'PATCH_APPLIED') info = `changes=${(e.data && e.data.changes && e.data.changes.length) || 0}`;
     else if (e.type === 'TEST_RESULT') info = `ok=${e.data && e.data.ok}`;
     else if (e.type === 'REVERT') info = `snapshot=${e.data && e.data.snapshotId}`;
+    else if (e.type === 'REVERT_CHECK') info = `warnings=${Array.isArray(e.data && e.data.warnings) ? e.data.warnings.length : 0}`;
     else if (e.type === 'TASK_DONE') info = `task=${e.data && e.data.title}`;
     lines.push(`${ts}  ${e.type}  ${info}`);
   }
   tabMemory.textContent = lines.join('\n');
 }
+let lastTabClickTs = 0;
+let lastSelectedTab = 'diff';

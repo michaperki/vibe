@@ -100,6 +100,11 @@ body {
 }
 .msg.user .bubble { background: #173b52; border: 1px solid var(--border); }
 .msg.agent .bubble { background: #142236; border: 1px solid var(--border); }
+.msg.system .bubble { background: #0f1826; border: 1px dashed var(--border); color: var(--muted); font-size: 0.85rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.msg.system .bubble details { margin-top: 6px; }
+.msg.system .bubble summary { cursor: pointer; color: #9aa7b4; }
+.mini-copy { margin-left: 6px; padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); background: var(--elev); color: var(--text); border-radius: 6px; cursor: pointer; }
+.mini-copy:hover { filter: brightness(1.05); }
 .msg .who { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
 
 .chat-input {
@@ -218,3 +223,11 @@ body {
 /* V5 tweak: tailwind-friendly spacing */
 
 /* V5 tweak: using css-vars */
+
+/* Execution mini copy button */
+.mini-copy { margin-left: 6px; padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); background: var(--elev); color: var(--text); border-radius: 6px; cursor: pointer; }
+.mini-copy:hover { filter: brightness(1.05); }
+
+/* Soften Done column */
+.kanban-col[data-col="DONE"] .card { opacity: 0.85; }
+.kanban-col[data-col="DONE"] .badge.done { filter: saturate(0.7) brightness(0.95); }

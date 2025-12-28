@@ -12,6 +12,7 @@
       <div class="subtitle" id="subtitle">Latest — Real Planning + Controlled Execution</div>
       <div class="workspace-info" id="workspaceInfo" title="Workspace root"></div>
       <span id="gitTag" class="tiny-tag" title="Git integration state"></span>
+      <button id="btnCopyBranch" class="reset-btn" title="Copy Git branch">Copy Branch</button>
       <div class="controls">
         <div class="mode-toggle" aria-label="Mode"></div>
         <button id="btnAutopilot" class="auto-btn" title="Autopilot toggles agent pacing">Autopilot: On</button>
@@ -73,7 +74,12 @@
           <pre id="tab-diff" class="tab-panel code active" aria-label="Diff"></pre>
           <pre id="tab-logs" class="tab-panel code" aria-label="Logs"></pre>
           <pre id="tab-tests" class="tab-panel code" aria-label="Tests"></pre>
-          <pre id="tab-plan" class="tab-panel code" aria-label="Plan JSON"></pre>
+          <div id="tab-plan" class="tab-panel code" aria-label="Plan">
+            <div class="plan-toolbar" style="display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;">
+              <button id="btnPlanToggle" class="modal-btn" title="Toggle plan view">View raw JSON</button>
+            </div>
+            <pre id="planBody" class="code" style="white-space:pre-wrap; background:transparent; border:none; padding:0; margin:0;"></pre>
+          </div>
           <pre id="tab-memory" class="tab-panel code" aria-label="Memory"></pre>
         </div>
       </section>
@@ -87,6 +93,7 @@
           <div class="modal-title">Diff Preview</div>
           <div class="modal-actions">
             <select id="modalFileSelect" class="modal-select" title="Select file"></select>
+            <input id="modalFilter" type="text" class="modal-select" placeholder="Filter" title="Filter diff" />
             <button id="modalRevertFile" class="modal-btn" title="Revert selected file">Revert File</button>
             <button id="modalReapplyFile" class="modal-btn" title="Reapply selected file">Reapply File</button>
             <button id="modalCopy" class="modal-btn" title="Copy diff">Copy</button>
@@ -125,6 +132,12 @@
           <div class="modal-actions">
             <label style="margin-right:8px; font-size:12px; color:#9aa7b4; display:flex; align-items:center; gap:6px;">
               <input id="devTailToggle" type="checkbox" /> Tail
+            </label>
+            <label style="margin-right:8px; font-size:12px; color:#9aa7b4; display:flex; align-items:center; gap:6px;">
+              <input id="devKeepStrictToggle" type="checkbox" checked /> Keep Regions Strict
+            </label>
+            <label style="margin-right:8px; font-size:12px; color:#9aa7b4; display:flex; align-items:center; gap:6px;">
+              <input id="devExecInChatToggle" type="checkbox" /> Show execution in chat
             </label>
             <button id="devRefresh" class="modal-btn" title="Refresh logs">Refresh</button>
             <button id="devCopy" class="modal-btn" title="Copy logs">Copy</button>

@@ -53,8 +53,10 @@ const VIBE_DIR = path.join(ROOT, '.vibe');
 const EVENTS_FILE = path.join(VIBE_DIR, 'events.json');
 // In-memory debug ring buffer (non-persistent)
 const DEBUG_LOGS = [];
+const DEBUG_LOG_LIMIT = Math.max(5, Number(process.env.VIBE_DEBUG_LOG_LIMIT || 50));
 // Simple concurrency lock for /api/patch to serialize writes
 let PATCH_BUSY = false;
+let REVERT_BUSY = false;
 const MAX_WRITE_BYTES = 500_000; // guard against oversized writes
 const SEARCH_MAX_FILE_BYTES = 300_000; // max file size considered by /api/search
 
@@ -87,7 +89,7 @@ async function gitEnsureRunBranch() {
 function pushDebug(entry) {
   try {
     DEBUG_LOGS.push(entry);
-    if (DEBUG_LOGS.length > 50) DEBUG_LOGS.shift();
+    if (DEBUG_LOGS.length > DEBUG_LOG_LIMIT) DEBUG_LOGS.shift();
   } catch {}
 }
 function sanitizeMessages(msgs, maxLen = 2000) {
@@ -99,7 +101,7 @@ function sanitizeMessages(msgs, maxLen = 2000) {
   } catch { return []; }
 }
 function validateActionsStrict(actions) {
-  const allowed = new Set(['READ_FILE','READ','VIEW_FILE','OPEN_FILE','CREATE_FILE','CREATE_FILE_BINARY','UPDATE_FILE','CREATE_DIR','EMIT_PLAN','REPLAN','PROCEED_EXECUTION','HALT_EXECUTION','PLAN_ONLY','ASK_INPUT']);
+  const allowed = new Set(['READ_FILE','READ','VIEW_FILE','OPEN_FILE','CREATE_FILE','CREATE_FILE_BINARY','UPDATE_FILE','CREATE_DIR','EDIT_DIFF','EMIT_PLAN','REPLAN','PROCEED_EXECUTION','HALT_EXECUTION','PLAN_ONLY','ASK_INPUT']);
   const errs = [];
   for (const a of (actions||[])) {
     if (!a) { errs.push('null action'); continue; }
@@ -109,8 +111,11 @@ function validateActionsStrict(actions) {
     if ((typ === 'CREATE_FILE' || typ === 'UPDATE_FILE') && (typeof a.path !== 'string' || a.path.trim() === '' || typeof a.content !== 'string')) {
       errs.push(`${typ} requires path and content`);
     }
-    if (typ === 'CREATE_FILE_BINARY' && (typeof a.path !== 'string' || a.path.trim() === '' || typeof a.base64 !== 'string')) {
-      errs.push('CREATE_FILE_BINARY requires path and base64');
+    if (typ === 'CREATE_FILE_BINARY') {
+      const hasB64 = (typeof a.base64 === 'string') || (typeof a.contentBase64 === 'string');
+      if (typeof a.path !== 'string' || a.path.trim() === '' || !hasB64) {
+        errs.push('CREATE_FILE_BINARY requires path and base64');
+      }
     }
     if (typ === 'READ_FILE' && (typeof a.path !== 'string' || a.path.trim() === '')) {
       errs.push('READ_FILE requires path');
@@ -156,7 +161,9 @@ function toActionRecord(a) {
   const pathLike = a.path || a.file || a.name || null;
   const content = a.content !== undefined ? String(a.content) : undefined;
   const paths = Array.isArray(a.paths) ? a.paths.slice(0, 50).map(String) : undefined;
-  return { type, path: pathLike, content, paths };
+  const base64 = (typeof a.base64 === 'string') ? a.base64 : (typeof a.contentBase64 === 'string' ? a.contentBase64 : undefined);
+  const diff = (typeof a.diff === 'string') ? a.diff : undefined;
+  return { type, path: pathLike, content, paths, base64, diff };
 }
 function validateActionsBasic(actions) {
   const out = { actions: [], missingContent: [], proceedWithEmpty: false };
@@ -263,7 +270,7 @@ function summarizeTree(entries, max = 50) {
   };
 }
 
-async function searchRepo(start, q, maxMatches = 50, maxFileSize = 1_000_000) {
+async function searchRepo(start, q, maxMatches = 50, maxFileSize = 1_000_000, extFilter = null) {
   const matches = [];
   q = q.toLowerCase();
   async function walk(dir) {
@@ -277,6 +284,11 @@ async function searchRepo(start, q, maxMatches = 50, maxFileSize = 1_000_000) {
         try {
           const stat = await fsp.stat(fp);
           if (stat.size > Math.min(maxFileSize, SEARCH_MAX_FILE_BYTES)) continue;
+          if (extFilter) {
+            const ext = path.extname(fp).toLowerCase().replace(/^\./, '');
+            const want = String(extFilter).toLowerCase().replace(/^\./,'');
+            if (ext !== want) continue;
+          }
           const text = await fsp.readFile(fp, 'utf8');
           const lines = text.split(/\r?\n/);
           for (let i = 0; i < lines.length; i++) {
@@ -407,19 +419,49 @@ async function snapshotChanges(snapshotId, changes) {
   }
 }
 
+let EVENTS_WRITE_PROMISE = Promise.resolve();
 async function appendEvent(evt) {
   await ensureDir(VIBE_DIR);
-  let list = [];
-  try { const raw = await fsp.readFile(EVENTS_FILE, 'utf8'); list = JSON.parse(raw) || []; } catch {}
-  list.push(evt);
-  await fsp.writeFile(EVENTS_FILE, JSON.stringify(list, null, 2), 'utf8');
+  const doWrite = async () => {
+    let list = [];
+    try {
+      list = await readEvents();
+      if (!Array.isArray(list)) list = [];
+    } catch { list = []; }
+    list.push(evt);
+    const txt = JSON.stringify(list, null, 2);
+    const tmp = EVENTS_FILE + '.tmp';
+    try { await fsp.writeFile(tmp, txt, 'utf8'); await fsp.rename(tmp, EVENTS_FILE); } finally {
+      try { await fsp.unlink(tmp); } catch {}
+    }
+    try { await fsp.writeFile(EVENTS_FILE + '.bak', txt, 'utf8'); } catch {}
+  };
+  EVENTS_WRITE_PROMISE = EVENTS_WRITE_PROMISE.then(doWrite, doWrite);
+  return EVENTS_WRITE_PROMISE;
 }
 
 async function readEvents() {
+  // Try normal parse
   try {
     const raw = await fsp.readFile(EVENTS_FILE, 'utf8');
     return JSON.parse(raw) || [];
-  } catch { return []; }
+  } catch (e) {
+    // Attempt salvage by trimming to last closing bracket
+    try {
+      const raw = await fsp.readFile(EVENTS_FILE, 'utf8');
+      const idx = raw.lastIndexOf(']');
+      if (idx >= 0) {
+        const cut = raw.slice(0, idx + 1);
+        try { return JSON.parse(cut) || []; } catch {}
+      }
+    } catch {}
+    // Fallback to backup file
+    try {
+      const bak = await fsp.readFile(EVENTS_FILE + '.bak', 'utf8');
+      return JSON.parse(bak) || [];
+    } catch {}
+    return [];
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -667,7 +709,7 @@ const server = http.createServer(async (req, res) => {
           const toolActs = actions
             .map(toActionRecord)
             .filter(Boolean);
-          const isToolPlan = toolActs.some(r => /^(CREATE_|UPDATE_|MODIFY_|WRITE_|APPEND_|EDIT_|REPLACE_|CREATE_DIR|CREATE_FILE|UPDATE_FILE)$/.test(r.type));
+          const isToolPlan = toolActs.some(r => /^(CREATE_|UPDATE_|MODIFY_|WRITE_|APPEND_|EDIT_|REPLACE_|CREATE_DIR|CREATE_FILE|UPDATE_FILE|EDIT_DIFF)$/.test(r.type));
           if (isToolPlan) {
             const lastUser = history.slice().reverse().find(m => m && m.role === 'user' && (m.content||'').trim().length > 4);
             const goal = (lastUser && lastUser.content) ? String(lastUser.content).trim() : text;
@@ -675,13 +717,16 @@ const server = http.createServer(async (req, res) => {
             // Group directories and file writes
             const dirPaths = [];
             const fileWrites = [];
+            let combinedDiff = '';
             for (const r of toolActs) {
               if (r.type === 'CREATE_DIR' || r.type === 'CREATE_DIRECTORY') {
                 if (r.path) dirPaths.push(r.path);
               } else if (r.type === 'CREATE_FILE_BINARY') {
-                if (r.path && r.content !== undefined) fileWrites.push({ path: r.path, base64: r.content });
+                if (r.path && r.base64 !== undefined) fileWrites.push({ path: r.path, base64: r.base64 });
               } else if (r.type === 'CREATE_FILE' || r.type === 'CREATE' || r.type === 'UPDATE_FILE' || r.type === 'MODIFY_FILE' || r.type === 'WRITE_FILE' || r.type === 'EDIT_FILE' || r.type === 'APPEND_FILE' || r.type === 'REPLACE_IN_FILE') {
                 if (r.path && r.content !== undefined) fileWrites.push({ path: r.path, content: r.content });
+              } else if (r.type === 'EDIT_DIFF' && r.diff) {
+                combinedDiff += (combinedDiff ? '\n' : '') + String(r.diff);
               }
             }
             // One task per directory (mkdir step)
@@ -690,9 +735,22 @@ const server = http.createServer(async (req, res) => {
             }
             // Single grouped task for all file writes
             if (fileWrites.length) {
-              const title = fileWrites.length === 1 ? `Apply change ${fileWrites[0].path}` : `Apply file changes (${fileWrites.length})`;
+              const title = fileWrites.length === 1 ? `Write ${fileWrites[0].path}` : `Write ${fileWrites.length} file(s)`;
               const steps = fileWrites.map(w => `write ${w.path}`);
               planTasks.push({ taskId: `t_${Date.now()}_${planTasks.length+1}`, title, status: 'PLANNED', steps, notes: '', writes: fileWrites });
+            }
+            // One grouped task for EDIT_DIFF if provided
+            if (combinedDiff.trim()) {
+              // Try to extract file paths from diff headers for steps
+              const paths = [];
+              for (const line of combinedDiff.split(/\r?\n/)) {
+                if (line.startsWith('+++ ')) {
+                  const m = line.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
+                  if (m && m[1]) paths.push(m[1]);
+                }
+              }
+              const steps = paths.map(p => `diff ${p}`);
+              planTasks.push({ taskId: `t_${Date.now()}_${planTasks.length+1}`, title: `Apply diff (${paths.length||1} files)`, status: 'PLANNED', steps, notes: '', diff: combinedDiff });
             }
             if (planTasks.length) {
               const plan = { planId: `tool_plan_${Date.now()}`, goal, tasks: planTasks };
@@ -768,7 +826,29 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, { plan, provider: 'mock', error: String(e && e.message || e) });
         }
       }
+      if (pathClean === '/api/wrapup' && req.method === 'POST') {
+        const body = await readBody(req);
+        const summary = body && body.summary;
+        if (!summary || typeof summary !== 'object') return sendJSON(res, { error: 'summary required' }, 400);
+        try {
+          let message;
+          try { message = await openaiWrapUp(summary); }
+          catch (e) {
+            // Fallback deterministic
+            const files = Array.isArray(summary.changes) ? summary.changes.map(c=>c.path).slice(0,3) : [];
+            const tests = summary.tests && summary.tests.ok ? 'pass' : 'fail';
+            message = `Done — ${String(summary.goal||summary.task||'task')} • ${files.length?`Files: ${files.join(', ')}`:'No file changes'} • Tests: ${tests}`;
+            if (!summary.tests || !summary.tests.ok) message += '. I can show failing output or revert to the last snapshot.';
+          }
+          return sendJSON(res, { message });
+        } catch (e) { return sendJSON(res, { error: String(e&&e.message||e) }, 500); }
+      }
       if (pathClean === '/api/revert' && req.method === 'POST') {
+        if (REVERT_BUSY) {
+          return sendJSON(res, { error: 'revert in progress, try again' }, 423);
+        }
+        REVERT_BUSY = true;
+        try {
         const body = await readBody(req);
         const snapshotId = String(body.snapshotId || '').trim();
         if (!snapshotId) return sendJSON(res, { error: 'snapshotId required' }, 400);
@@ -855,6 +935,7 @@ const server = http.createServer(async (req, res) => {
         await appendEvent({ ts: Date.now(), type: direction === 'before' ? 'REVERT' : 'REAPPLY', data: { snapshotId, restored: changes, partial: !!(onlyPaths && onlyPaths.length) } });
         const restoredWithAbs = changes.map(c => ({ ...c, absPath: path.join(ROOT, c.path) }));
         return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, restored: restoredWithAbs, diff: combinedDiff, warnings });
+        } finally { REVERT_BUSY = false; }
       }
       if (pathClean === '/api/patch' && req.method === 'POST') {
         if (PATCH_BUSY) {
@@ -968,7 +1049,7 @@ const server = http.createServer(async (req, res) => {
           if (await hasNpmTest()) {
             cmd = process.platform === 'win32' ? 'npm.cmd test --silent' : 'npm test --silent';
           } else {
-            return sendJSON(res, { ok: true, code: 0, stdout: 'No test script; treating as pass.', stderr: '' });
+            return sendJSON(res, { ok: true, code: 0, stdout: 'Tests: n/a', stderr: '' });
           }
         } else if (body.cmd === 'node -v') {
           cmd = 'node -v';
@@ -1000,6 +1081,38 @@ const server = http.createServer(async (req, res) => {
         const list = await readEvents();
         return sendJSON(res, { events: list });
       }
+      if (pathClean === '/api/snapshots/list' && req.method === 'GET') {
+        const base = path.join(ROOT, '.vibe', 'snapshots');
+        const out = [];
+        try {
+          const ents = await fsp.readdir(base, { withFileTypes: true });
+          for (const ent of ents) {
+            if (!ent.isDirectory()) continue;
+            const id = ent.name;
+            const fp = path.join(base, id);
+            const st = await fsp.stat(fp).catch(() => null);
+            out.push({ id, mtimeMs: st ? st.mtimeMs : 0 });
+          }
+          out.sort((a,b) => b.mtimeMs - a.mtimeMs);
+        } catch {}
+        return sendJSON(res, { snapshots: out });
+      }
+      if (pathClean === '/api/snapshots/prune' && (req.method === 'POST' || req.method === 'GET')) {
+        const keepQ = searchParams.get('keep');
+        const body = req.method === 'POST' ? await readBody(req) : {};
+        const keep = Math.max(0, Number((body.keep !== undefined ? body.keep : (keepQ || 0))));
+        const base = path.join(ROOT, '.vibe', 'snapshots');
+        let removed = [];
+        try {
+          const ents = await fsp.readdir(base, { withFileTypes: true });
+          const dirs = [];
+          for (const ent of ents) { if (ent.isDirectory()) { const fp = path.join(base, ent.name); const st = await fsp.stat(fp).catch(()=>null); dirs.push({ id: ent.name, m: st?st.mtimeMs:0 }); } }
+          dirs.sort((a,b)=>b.m - a.m);
+          const toDelete = dirs.slice(keep);
+          for (const d of toDelete) { await fsp.rm(path.join(base, d.id), { recursive: true, force: true }); removed.push(d.id); }
+        } catch {}
+        return sendJSON(res, { ok: true, removed });
+      }
       if (pathClean === '/api/tree') {
         const userPath = searchParams.get('path') || '.';
         const depth = Math.max(0, Math.min(5, Number(searchParams.get('depth') || '2')));
@@ -1018,12 +1131,188 @@ const server = http.createServer(async (req, res) => {
         const { size, content } = await readTextFile(full);
         return sendJSON(res, { path: userPath, size, content });
       }
+      if (pathClean === '/api/patch/diff' && req.method === 'POST') {
+        const body = await readBody(req);
+        const diffText = String(body.diff || '').replace(/\r\n/g, '\n');
+        const keepRegions = body.keepRegions !== false; // default true
+        const preview = !!body.preview;
+        if (!diffText.trim()) return sendJSON(res, { error: 'diff required' }, 400);
+
+        function allowWrite(rel) {
+          const base = path.basename(rel);
+          if (base === '.git') return false;
+          if (rel.includes('/.git/') || rel.includes('\\.git\\')) return false;
+          if (rel.split(/[\\/]/).includes('.git')) return false;
+          if (rel.includes('node_modules')) return false;
+          return true;
+        }
+        function parseUnifiedDiff(text) {
+          const files = [];
+          const lines = text.split(/\n/);
+          let i = 0; let cur = null;
+          while (i < lines.length) {
+            const line = lines[i];
+            if (line.startsWith('--- ')) {
+              const next = lines[i+1] || '';
+              const mOld = line.match(/^---\s+(?:a\/)?(.+)$/);
+              const mNew = next.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
+              if (mOld && mNew) {
+                if (cur) files.push(cur);
+                cur = { oldPath: mOld[1], newPath: mNew[1], hunks: [] };
+                i += 2; continue;
+              }
+            }
+            if (line.startsWith('@@ ')) {
+              const m = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+              if (m && cur) {
+                const hunk = { aStart: Number(m[1]||'0'), aCount: Number(m[2]||'0'), bStart: Number(m[3]||'0'), bCount: Number(m[4]||'0'), lines: [] };
+                i++;
+                while (i < lines.length) {
+                  const hl = lines[i];
+                  if (/^[@][@]/.test(hl) || /^---\s/.test(hl)) break;
+                  if (hl.startsWith(' ') || hl.startsWith('+') || hl.startsWith('-')) hunk.lines.push(hl);
+                  else if (hl.trim() === '') hunk.lines.push(' ');
+                  else break;
+                  i++;
+                }
+                cur.hunks.push(hunk);
+                continue;
+              }
+            }
+            i++;
+          }
+          if (cur) files.push(cur);
+          return files;
+        }
+        function findKeepRegions(text) {
+          const regs = [];
+          const ls = text.split(/\n/);
+          let start = null;
+          for (let idx = 0; idx < ls.length; idx++) {
+            const l = ls[idx];
+            if (l.includes('VIBE-KEEP START')) start = idx + 1;
+            if (l.includes('VIBE-KEEP END') && start !== null) { regs.push([start, idx + 1]); start = null; }
+          }
+          return regs;
+        }
+        function withinKeep(regs, lineNo) {
+          for (const [a,b] of regs) { if (lineNo >= a && lineNo <= b) return true; }
+          return false;
+        }
+        function applyHunks(orig, hunks, regs, warnings) {
+          const inLines = orig.split(/\n/);
+          let out = [];
+          let ptr = 1; // 1-based current read pointer in inLines
+          let applied = 0, skipped = 0;
+          const FUZZ = 3;
+          for (const h of hunks) {
+            // Fuzzy align start using first context line within +/- FUZZ of h.aStart
+            let firstCtx = null;
+            for (const line of h.lines) { if (line[0] === ' ') { firstCtx = line.slice(1); break; } }
+            let targetStart = h.aStart;
+            if (firstCtx) {
+              const searchStart = Math.max(ptr, h.aStart - FUZZ);
+              const searchEnd = Math.min(inLines.length, h.aStart + FUZZ);
+              for (let pos = searchStart; pos <= searchEnd; pos++) {
+                if (inLines[pos - 1] === firstCtx) { targetStart = pos; break; }
+              }
+              if (targetStart !== h.aStart) warnings.push({ kind: 'fuzzy_offset', note: `Applied with offset near ${h.aStart}` });
+            }
+            if (targetStart < ptr) { warnings.push({ kind: 'out_of_order', note: 'Hunk before current pointer; skipping' }); skipped++; continue; }
+            // Copy up to targetStart - 1
+            while (ptr < targetStart && ptr <= inLines.length) { out.push(inLines[ptr - 1]); ptr++; }
+
+            // Attempt to apply hunk lines; rollback if any mismatch
+            const saveOutLen = out.length;
+            const savePtr = ptr;
+            let hunkOk = true;
+            for (const hl of h.lines) {
+              const sign = hl[0];
+              const txt = hl.slice(1);
+              if (sign === ' ') {
+                if (inLines[ptr - 1] !== txt) { warnings.push({ kind: 'context_mismatch', note: 'Context mismatch; skipping hunk' }); hunkOk = false; break; }
+                out.push(txt); ptr++;
+              } else if (sign === '-') {
+                if (keepRegions && withinKeep(regs, ptr)) { warnings.push({ kind: 'keep_region', note: 'Attempted delete within keep region' }); hunkOk = false; break; }
+                if (inLines[ptr - 1] !== txt) { warnings.push({ kind: 'delete_mismatch', note: 'Delete line mismatch; skipping hunk' }); hunkOk = false; break; }
+                // delete: advance ptr without adding line
+                ptr++;
+              } else if (sign === '+') {
+                if (keepRegions && withinKeep(regs, ptr)) { warnings.push({ kind: 'keep_region', note: 'Attempted insert within keep region' }); hunkOk = false; break; }
+                out.push(txt);
+              }
+            }
+            if (hunkOk) {
+              applied++;
+            } else {
+              // rollback
+              out.length = saveOutLen;
+              ptr = savePtr;
+              skipped++;
+              // leave original content unchanged for this hunk; continue to next hunk
+            }
+          }
+          // copy remainder
+          while (ptr <= inLines.length) { out.push(inLines[ptr - 1]); ptr++; }
+          return { text: out.join('\n'), applied, skipped };
+        }
+
+        const patches = parseUnifiedDiff(diffText);
+        if (!patches.length) return sendJSON(res, { error: 'no file hunks found in diff' }, 400);
+        const changes = [];
+        const warnings = [];
+        for (const p of patches) {
+          const rel = (p.newPath || p.oldPath || '').replace(/^\/+/, '');
+          if (!rel) { warnings.push({ path: rel, kind: 'invalid_path' }); continue; }
+          if (!allowWrite(rel)) { warnings.push({ path: rel, kind: 'path_blocked' }); continue; }
+          const full = safeJoin(rel);
+          let existed = await exists(full);
+          let before = existed ? (await fsp.readFile(full, 'utf8')) : '';
+          const regs = keepRegions ? findKeepRegions(before) : [];
+          const { text: afterText, applied, skipped } = applyHunks(before, p.hunks, regs, warnings);
+          const type = !existed && afterText !== undefined ? 'added'
+            : existed && afterText === undefined ? 'deleted'
+            : existed && before !== afterText ? 'modified'
+            : 'unchanged';
+          if (!preview && afterText !== undefined && type !== 'unchanged') {
+            await writeFileRecursive(full, afterText);
+          }
+          const fileDiff = simpleUnifiedDiff(rel, before, afterText);
+          changes.push({ path: rel, type, diff: fileDiff, before, after: afterText, appliedHunks: applied, skippedHunks: skipped });
+        }
+        let snapshotId = null;
+        let commitHash = null;
+        if (!preview) {
+          snapshotId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+          await snapshotChanges(snapshotId, changes);
+          try {
+            if (GIT_ENABLED && isGitRepo()) {
+              await gitEnsureRunBranch();
+              const filesToAdd = changes.map(c => c.path).map(p => `"${p.replace(/"/g, '\\"')}"`).join(' ');
+              if (filesToAdd) {
+                await execGit(`git add -- ${filesToAdd}`);
+                const msg = `[ViBE] Apply diff (snapshot ${snapshotId})`;
+                await execGit(`git commit -m ${JSON.stringify(msg)}`);
+                const out = await execGit('git rev-parse HEAD');
+                commitHash = (out.stdout || '').trim();
+              }
+            }
+          } catch (e) { pushDebug({ ts: Date.now(), kind: 'git', action: 'commit_error', error: String(e && e.message || e) }); }
+          await appendEvent({ ts: Date.now(), type: 'PATCH_APPLIED', data: { snapshotId, changes: changes.map(c => ({ path: c.path, type: c.type })), commitHash, title: 'Apply diff' } });
+        }
+        const diffAll = changes.map(c => c.diff).join('\n');
+        const responseChanges = changes.map(({ path: rel, type, diff }) => ({ path: rel, absPath: path.join(ROOT, rel), type, diff }));
+        return sendJSON(res, { ok: true, preview, snapshotId, workspaceRoot: ROOT, changes: responseChanges, diff: diffAll, warnings, commitHash, gitBranch: GIT_BRANCH });
+      }
       if (pathClean === '/api/search') {
         const q = (searchParams.get('q') || '').trim();
         if (!q) return sendJSON(res, { error: 'q required' }, 400);
         const max = Math.max(1, Math.min(200, Number(searchParams.get('max') || '50')));
-        const out = await searchRepo(ROOT, q, max);
-        return sendJSON(res, { q, matches: out });
+        const dir = (searchParams.get('dir') || '.').trim();
+        const ext = (searchParams.get('ext') || '').trim();
+        const root = safeJoin(dir);
+        const out = await searchRepo(root, q, max, 1_000_000, ext || null);
+        return sendJSON(res, { q, dir, ext: ext || null, matches: out });
       }
       return sendJSON(res, { error: 'Unknown endpoint' }, 404);
     }
@@ -1094,19 +1383,26 @@ async function openaiChat(text, context, history = [], options = {}) {
     'Policy:',
     '1) Clarify once when ambiguous. If the user answers your clarification, PRODUCE A PLAN (do not keep re-clarifying).',
     '2) Prefer in-repo solutions. If the user says "from scratch", assume scaffolding a new app INSIDE this repo (e.g., ./todo-app) unless they explicitly request a separate project.',
-    '3) When ready to propose work, emit actions from this set as needed: EMIT_PLAN (with plan), REPLAN (with plan), PROCEED_EXECUTION, HALT_EXECUTION, ASK_INPUT (with question/options), PLAN_ONLY (no execution). If you propose concrete file writes, prefer EMIT_PLAN immediately followed by PROCEED_EXECUTION.',
+    '3) When ready to propose work, emit actions from this set as needed: EMIT_PLAN (with plan), REPLAN (with plan), PROCEED_EXECUTION, HALT_EXECUTION, ASK_INPUT (with question/options), PLAN_ONLY (no execution).',
     '4) Tasks must be relevant to THIS repo, start with status PLANNED, and be realistic next steps.',
     '5) Output must be exactly one JSON object: { "message": string, "actions": Action[] }. No additional prose.',
-    '6) Available tools: READ_FILE { path }, CREATE_FILE { path, content }, CREATE_FILE_BINARY { path, base64 }, UPDATE_FILE { path, content }, EMIT_PLAN/REPLAN { plan }, PROCEED_EXECUTION, HALT_EXECUTION, PLAN_ONLY, ASK_INPUT.',
-    '7) If you need to inspect current code before updating, call READ_FILE first. When updating, include full file content in UPDATE_FILE (no diffs/snippets).',
-    '8) When creating files, use CREATE_FILE with fields { path, content } and include the full file contents needed (HTML/CSS/JS). Avoid partial snippets.',
-    '9) When modifying existing files, use UPDATE_FILE with { path, content } and include the entire revised file content. Do not emit diffs.',
+    '6) Available tools: READ_FILE { path }, CREATE_FILE { path, content }, CREATE_FILE_BINARY { path, base64 }, UPDATE_FILE { path, content }, EDIT_DIFF { diff }, EMIT_PLAN/REPLAN { plan }, PROCEED_EXECUTION, HALT_EXECUTION, PLAN_ONLY, ASK_INPUT.',
+    '7) Preferred write method is EDIT_DIFF with unified diffs. Use minimal context and accurate hunks. Avoid full-file rewrites unless absolutely necessary.',
+    '8) When creating files, use CREATE_FILE with fields { path, content } and include the full file contents needed (HTML/CSS/JS).',
+    '9) When modifying existing files without diffs, you may use UPDATE_FILE with { path, content } including the entire revised file content (avoid if large).',
     '10) When creating directories, use CREATE_DIR with { path }.',
     '11) Your message should briefly state assumptions and next step. Do not ask meta-clarifications like "what does from scratch mean" when the domain is obvious (e.g., a to-do app).',
     '12) If the user requests to start/stop/continue execution, emit PROCEED_EXECUTION or HALT_EXECUTION accordingly (do not rely on client shortcuts).',
-    '13) If you return PROCEED_EXECUTION with no pending tasks, it is invalid; choose REPLAN or UPDATE_FILE/CREATE_FILE/ASK_INPUT to create new work.',
-    '14) If a file is being revised, return UPDATE_FILE with the entire target file content.',
-    '15) Do not emit diffs or partial fragments.',
+    '13) If you return PROCEED_EXECUTION with no pending tasks, it is invalid; choose REPLAN or UPDATE_FILE/CREATE_FILE/ASK_INPUT/EDIT_DIFF to create new work.',
+    '14) Example unified diff:',
+    '--- a/src/main.js',
+    '+++ b/src/main.js',
+    '@@ -1,3 +1,4 @@',
+    " console.log('start')",
+    "+console.log('hello from ViBE')",
+    ' function run() {',
+    '   return true;',
+    'MESSAGE STYLE: Write concise, action-focused messages. Include 1) Summary: <what you did/plan>, 2) Files: <paths>, 3) Next: <short suggestion>. Avoid generic statements like \"No pending tasks\" or UI states. Keep to 1–2 lines.',
     'Context will be provided with a small repo summary and recent chat history. Environment constraints: write access only within this workspace; cannot create external repos here.',
   ].join('\n');
   const messages = [
@@ -1156,4 +1452,33 @@ async function openaiChat(text, context, history = [], options = {}) {
   try { obj = JSON.parse(textOut); } catch { throw new Error('Invalid JSON from model'); }
   try { pushDebug({ ...debugBase, response: { raw: String(textOut).slice(0, 5000), parsedKeys: Object.keys(obj || {}) } }); } catch {}
   return obj;
+}
+
+async function openaiWrapUp(summary) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const base = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+  if (!apiKey) throw new Error('OPENAI_API_KEY missing');
+  const system = [
+    'You are a succinct assistant writing a final wrap-up for a completed coding task.',
+    'Write 1–2 lines, high signal. Use ONLY provided facts.',
+    'Mention at most 1–2 meaningful files (ignore .gitkeep and trivial scaffolds).',
+    'State outcome and suggest a concrete next step.',
+    'If tests failed, say so first and offer to show errors or revert.',
+  ].join('\n');
+  const facts = JSON.stringify(summary);
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `Facts: ${facts}` },
+      { role: 'user', content: 'Now produce the final wrap-up (1–2 lines). No boilerplate. No assumptions beyond facts.' }
+    ],
+    temperature: 0.2
+  };
+  const res = await fetch(`${base}/chat/completions`, { method:'POST', headers:{ 'Authorization':`Bearer ${apiKey}`, 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`OpenAI HTTP ${res.status}`);
+  const data = await res.json();
+  const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
+  return text.trim();
 }
