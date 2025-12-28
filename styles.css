@@ -40,6 +40,7 @@ body {
 .brand { font-weight: 700; letter-spacing: 0.5px; }
 .subtitle { color: var(--muted); font-size: 0.9rem; }
 .workspace-info { color: var(--muted); font-size: 0.85rem; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: 8px; }
+.tiny-tag { margin-left: 8px; font-size: 11px; background: #1b2a3a; color: #9aa7b4; padding: 2px 6px; border-radius: 999px; border: 1px solid var(--border); }
 .controls { display: flex; align-items: center; gap: 8px; }
 .mode-toggle { display: flex; gap: 6px; }
 .mode-btn, .reset-btn {
@@ -155,8 +156,12 @@ body {
   box-shadow: 0 1px 0 rgba(0,0,0,0.3);
   cursor: pointer;
 }
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent); }
 .card .title { font-weight: 600; }
 .card .status { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
+
+.pill { display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; margin-left:6px; border:1px solid var(--border); color:#9aa7b4; background:#1b2a3a; }
+.pill-reverted { background: color-mix(in oklab, var(--bad) 20%, #1b2a3a); color: var(--bad); border-color: color-mix(in oklab, var(--bad) 35%, transparent); }
 
 .badge { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 0.7rem; font-weight: 700; }
 .badge.planned { background: color-mix(in oklab, var(--planned) 25%, transparent); color: var(--planned); border: 1px solid color-mix(in oklab, var(--planned) 40%, transparent); }
@@ -175,6 +180,7 @@ body {
 .preview-btn:hover { filter: brightness(1.05); }
 .revert-btn { margin-left: 6px; background: var(--bad); color: #180606; border: none; padding: 4px 10px; border-radius: 8px; cursor: pointer; font-weight: 700; }
 .revert-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.hide { display: none !important; }
 
 .tab-panels { padding: 10px; overflow: auto; }
 .tab-panel { display: none; white-space: pre-wrap; }

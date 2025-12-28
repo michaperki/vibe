@@ -28,6 +28,7 @@ const wsClose = qs('#wsClose');
 const wsCopy = qs('#wsCopy');
 const wsCommand = qs('#wsCommand');
 const wsCurrent = qs('#wsCurrent');
+const gitTagEl = qs('#gitTag');
 // Dev Tools
 const btnDevTools = qs('#btnDevTools');
 const devModal = qs('#devModal');
@@ -57,6 +58,9 @@ const modalClose = qs('#modalClose');
 const modalCopy = qs('#modalCopy');
 const modalFileSelect = qs('#modalFileSelect');
 const kanbanStatusEl = qs('#kanbanStatus');
+const btnReapplyCard = qs('#btnReapplyCard');
+const modalRevertFile = qs('#modalRevertFile');
+const modalReapplyFile = qs('#modalReapplyFile');
 let statusTimer = null;
 let statusStart = 0;
 function startStatus(text) {
@@ -96,7 +100,7 @@ let v1BlockedTaskId = null; // which task will BLOCK (deterministic demo)
 // V2 ephemeral evidence store
 const v2Evidence = Object.create(null); // taskId -> {diff, logs, tests}
 const v3Evidence = Object.create(null); // taskId -> {diff, logs, tests}
-const v3Snapshots = Object.create(null); // taskId -> snapshotId
+const v3Snapshots = Object.create(null); // taskId -> [snapshotId]
 const apiBase = ''; // same-origin; server at /api
 let awaitingConfirm = false; // legacy; agent now controls proceed/halt via actions
 
@@ -107,6 +111,7 @@ const STATUS = {
   DONE: 'DONE',
   BLOCKED: 'BLOCKED',
   NEEDS_INPUT: 'NEEDS_INPUT',
+  REVERTED: 'REVERTED',
 };
 
 function normalizePlanInPlace(p) {
@@ -148,6 +153,7 @@ function badgeClassForStatus(status) {
     case STATUS.DONE: return 'done';
     case STATUS.BLOCKED: return 'blocked';
     case STATUS.NEEDS_INPUT: return 'needs';
+    case STATUS.REVERTED: return 'blocked';
     default: return 'planned';
   }
 }
@@ -156,19 +162,22 @@ function cardEl(task) {
   const el = document.createElement('div');
   el.className = 'card';
   el.dataset.taskId = task.id;
+  const pill = task.status === STATUS.REVERTED ? '<span class="pill pill-reverted">Reverted</span>' : '';
   el.innerHTML = `
-    <div class="title">${task.title}</div>
+    <div class="title">${task.title} ${pill}</div>
     <div class="status"><span class="badge ${badgeClassForStatus(task.status)}">${task.status}</span></div>
   `;
   el.addEventListener('click', () => {
     selectedTaskId = task.id;
     updateEvidence(task.id, task.status);
     persistV1();
+    renderKanban();
   });
   // Double-click to open diff preview
   el.addEventListener('dblclick', () => {
     selectedTaskId = task.id;
     updateEvidence(task.id, task.status);
+    renderKanban();
     openDiffModal();
   });
   return el;
@@ -183,12 +192,13 @@ function renderKanban() {
 
   for (const t of tasks) {
     const el = cardEl(t);
+    if (selectedTaskId && t.id === selectedTaskId) el.classList.add('selected');
     if (t.status === STATUS.PLANNED) colPlanned.appendChild(el);
     else if (t.status === STATUS.EXECUTING) colExecuting.appendChild(el);
     else if (t.status === STATUS.VERIFYING) colVerifying.appendChild(el);
     else if (t.status === STATUS.BLOCKED) colVerifying.appendChild(el);
     else if (t.status === STATUS.NEEDS_INPUT && colNeeds) colNeeds.appendChild(el);
-    else if (t.status === STATUS.DONE) colDone.appendChild(el);
+    else if (t.status === STATUS.DONE || t.status === STATUS.REVERTED) colDone.appendChild(el);
   }
 }
 
@@ -697,6 +707,40 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// Modal file-level revert/reapply handlers
+modalRevertFile?.addEventListener('click', async () => {
+  const t = tasks.find(x => x.id === selectedTaskId);
+  if (!t) return;
+  const snaps = v3Snapshots[selectedTaskId];
+  const snap = Array.isArray(snaps) ? snaps[snaps.length - 1] : snaps;
+  if (!snap) return;
+  const sel = modalFileSelect?.value || '__all__';
+  if (!sel || sel === '__all__') return; // file-level only
+  try {
+    const res = await apiPost('/api/revert', { snapshotId: snap, direction: 'before', paths: [sel] });
+    const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
+    v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `revert-file: ${sel}${warn}`, tests: 'N/A', files: v3Evidence[selectedTaskId]?.files || [] };
+    updateEvidence(selectedTaskId, tasks.find(x => x.id === selectedTaskId)?.status || STATUS.DONE);
+    addMessage({ who: 'agent', text: `Event: Reverted file ${sel} (snapshot ${snap}).` });
+  } catch (e) { addMessage({ who: 'agent', text: `Revert file failed: ${String(e)}` }); }
+});
+modalReapplyFile?.addEventListener('click', async () => {
+  const t = tasks.find(x => x.id === selectedTaskId);
+  if (!t) return;
+  const snaps = v3Snapshots[selectedTaskId];
+  const snap = Array.isArray(snaps) ? snaps[snaps.length - 1] : snaps;
+  if (!snap) return;
+  const sel = modalFileSelect?.value || '__all__';
+  if (!sel || sel === '__all__') return; // file-level only
+  try {
+    const res = await apiPost('/api/revert', { snapshotId: snap, direction: 'after', paths: [sel] });
+    const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
+    v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `reapply-file: ${sel}${warn}`, tests: 'N/A', files: v3Evidence[selectedTaskId]?.files || [] };
+    updateEvidence(selectedTaskId, tasks.find(x => x.id === selectedTaskId)?.status || STATUS.DONE);
+    addMessage({ who: 'agent', text: `Event: Reapplied file ${sel} (snapshot ${snap}).` });
+  } catch (e) { addMessage({ who: 'agent', text: `Reapply file failed: ${String(e)}` }); }
+});
+
 // Autopilot toggle
 let v5Autopilot = false;
 btnAutopilot?.addEventListener('click', () => {
@@ -712,30 +756,91 @@ btnAutopilot?.addEventListener('click', () => {
 // Revert button
 const btnRevertCard = qs('#btnRevertCard');
 function updateRevertButton() {
-  if (!btnRevertCard) return;
-  if (mode !== 'V4' && mode !== 'V5' && mode !== 'V6') { btnRevertCard.disabled = true; return; }
   const t = tasks.find(x => x.id === selectedTaskId);
-  if (!t) { btnRevertCard.disabled = true; return; }
-  const isDone = t.status === STATUS.DONE;
-  const hasSnap = Boolean(v3Snapshots[selectedTaskId]);
-  btnRevertCard.disabled = !(isDone && hasSnap);
+  const snapsCheck = v3Snapshots[selectedTaskId];
+  const hasSnap = Array.isArray(snapsCheck) ? snapsCheck.length > 0 : Boolean(snapsCheck);
+  const isReverted = !!(t && t.status === STATUS.REVERTED);
+  // Default hide both when no selection or no snapshot
+  if (!t || !hasSnap) {
+    if (btnRevertCard) { btnRevertCard.classList.add('hide'); btnRevertCard.disabled = true; }
+    if (btnReapplyCard) { btnReapplyCard.classList.add('hide'); btnReapplyCard.disabled = true; }
+    return;
+  }
+  // Show Revert when selected and not REVERTED; Show Reapply only when REVERTED
+  if (btnRevertCard) {
+    btnRevertCard.classList.toggle('hide', isReverted);
+    btnRevertCard.disabled = false;
+  }
+  if (btnReapplyCard) {
+    btnReapplyCard.classList.toggle('hide', !isReverted);
+    btnReapplyCard.disabled = !isReverted;
+  }
 }
 btnRevertCard?.addEventListener('click', async () => {
   const t = tasks.find(x => x.id === selectedTaskId);
   if (!t) return;
-  const snap = v3Snapshots[selectedTaskId];
+  const snaps2 = v3Snapshots[selectedTaskId];
+  const snap = Array.isArray(snaps2) ? snaps2[snaps2.length - 1] : snaps2;
   if (!snap) return;
   const ok = confirm(`Revert changes for card: ${t.title}?`);
   if (!ok) return;
   try {
-    const res = await apiPost('/api/revert', { snapshotId: snap });
-    v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `revert: ${res.snapshotId}`, tests: 'N/A' };
+    // Pre-check for divergence
+    try {
+      const chk = await apiPost('/api/revert/check', { snapshotId: snap, direction: 'before' });
+      const warns = Array.isArray(chk.warnings) ? chk.warnings : [];
+      if (warns.length) {
+        const msg = 'The following files have diverged since this card was applied and may be overwritten:\n' + warns.map(w => ` - ${w.path}`).join('\n') + '\n\nProceed with revert?';
+        const go = confirm(msg);
+        if (!go) return;
+      }
+    } catch {}
+    const res = await apiPost('/api/revert', { snapshotId: snap, direction: 'before' });
+    const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
+    v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `revert: ${res.snapshotId}${warn}`, tests: 'N/A' };
     updateEvidence(selectedTaskId, t.status);
     addMessage({ who: 'agent', text: `Event: Reverted card "${t.title}" (snapshot ${snap}).` });
+    try { v3Dispatch({ action: 'UPDATE_TASK', taskId: t.id, status: STATUS.REVERTED, notes: 'Reverted' }); } catch {}
+    try { const pt = (plan?.tasks || []).find(x => x.taskId === t.id); if (pt) pt.status = STATUS.REVERTED; } catch {}
+    try { const lt = tasks.find(x => x.id === t.id); if (lt) lt.status = STATUS.REVERTED; } catch {}
+    renderKanban();
+    updateEvidence(selectedTaskId, STATUS.REVERTED);
+    if (typeof updateRevertButton === 'function') updateRevertButton();
     try { await apiPost('/api/event', { type: 'REVERT', data: { snapshotId: snap, taskId: selectedTaskId, title: t.title } }); } catch {}
     try { await v6FetchAndRender(); } catch {}
   } catch (e) {
     addMessage({ who: 'agent', text: `Revert failed: ${String(e)}` });
+  }
+});
+
+btnReapplyCard?.addEventListener('click', async () => {
+  const t = tasks.find(x => x.id === selectedTaskId);
+  if (!t) return;
+  const snaps3 = v3Snapshots[selectedTaskId];
+  const snap = Array.isArray(snaps3) ? snaps3[snaps3.length - 1] : snaps3;
+  if (!snap) return;
+  const ok = confirm(`Reapply changes for card: ${t.title}?`);
+  if (!ok) return;
+  try {
+    // Pre-check for divergence
+    try {
+      const chk = await apiPost('/api/revert/check', { snapshotId: snap, direction: 'after' });
+      const warns = Array.isArray(chk.warnings) ? chk.warnings : [];
+      if (warns.length) {
+        const msg = 'The following files differ from the snapshot-before and may be overwritten by reapply:\n' + warns.map(w => ` - ${w.path}`).join('\n') + '\n\nProceed with reapply?';
+        const go = confirm(msg);
+        if (!go) return;
+      }
+    } catch {}
+    const res = await apiPost('/api/revert', { snapshotId: snap, direction: 'after' });
+    const warn = Array.isArray(res.warnings) && res.warnings.length ? (`\nwarnings:\n` + res.warnings.map(w => ` - ${w.path}: ${w.note || w.kind}`).join('\n')) : '';
+    v3Evidence[selectedTaskId] = { diff: res.diff || '(no diff)', logs: `reapply: ${res.snapshotId}${warn}`, tests: 'N/A' };
+    updateEvidence(selectedTaskId, t.status);
+    addMessage({ who: 'agent', text: `Event: Reapplied card "${t.title}" (snapshot ${snap}).` });
+    try { v3Dispatch({ action: 'UPDATE_TASK', taskId: t.id, status: STATUS.DONE, notes: 'Reapplied' }); } catch {}
+    try { await apiPost('/api/event', { type: 'REAPPLY', data: { snapshotId: snap, taskId: t.id, title: t.title } }); } catch {}
+  } catch (e) {
+    addMessage({ who: 'agent', text: `Reapply failed: ${String(e)}` });
   }
 });
 
@@ -823,6 +928,13 @@ try { subtitleEl.textContent = 'Latest — Real Planning + Controlled Execution'
       workspaceInfoEl.textContent = `Workspace: ${data.workspaceRoot}`;
       if (wsCurrent) wsCurrent.textContent = data.workspaceRoot;
       if (wsCommand) wsCommand.textContent = `node vibe.js "${data.workspaceRoot}"\n# Or to switch:\nnode vibe.js /path/to/your/repo`;
+    }
+    if (gitTagEl && data) {
+      const on = !!data.gitIntegrationOn;
+      const repo = !!data.gitEnabled;
+      const branch = data.gitBranch || '';
+      gitTagEl.textContent = repo ? (on ? `Git: On (${branch||'branch'})` : `Git: Repo (${branch||'branch'})`) : 'Git: Off';
+      gitTagEl.title = on ? 'Git integration active' : (repo ? 'Git repository detected; integration off' : 'No git repository detected');
     }
   } catch {}
 })();
@@ -972,23 +1084,14 @@ async function v7SetPlan(newPlan, provider) {
     addMessage({ who: 'agent', text: 'Received invalid plan from agent.' });
     return;
   }
-  // Merge behavior: if a plan already exists, append new tasks without wiping prior tasks
+  // Merge behavior: prefer identity by taskId; do not merge by title
   if (prevPlan && Array.isArray(prevPlan.tasks) && prevPlan.tasks.length) {
     const merged = { planId: prevPlan.planId || newPlan.planId || uuid(), goal: newPlan.goal || prevPlan.goal || '', tasks: [] };
-    const seenTitles = new Set();
-    for (const t of prevPlan.tasks) {
-      const title = (t.title || t.description || 'Task').toLowerCase();
-      seenTitles.add(title);
-      merged.tasks.push({ ...t });
-    }
+    const byId = new Map();
+    for (const t of prevPlan.tasks) { merged.tasks.push({ ...t }); byId.set(t.taskId, true); }
     for (const t of newPlan.tasks) {
-      const title = (t.title || t.description || 'Task').toLowerCase();
-      if (!seenTitles.has(title)) {
-        merged.tasks.push({ ...t });
-        seenTitles.add(title);
-      } else {
-        // If a task with same title exists, update its status/notes/steps if provided
-        const idx = merged.tasks.findIndex(x => (x.title || x.description || 'task').toLowerCase() === title);
+      if (t.taskId && byId.has(t.taskId)) {
+        const idx = merged.tasks.findIndex(x => x.taskId === t.taskId);
         if (idx >= 0) {
           const cur = merged.tasks[idx];
           const upd = { ...cur };
@@ -998,6 +1101,11 @@ async function v7SetPlan(newPlan, provider) {
           if (Array.isArray(t.writes)) upd.writes = t.writes;
           merged.tasks[idx] = upd;
         }
+      } else {
+        const nt = { ...t };
+        if (!nt.taskId) nt.taskId = uuid();
+        merged.tasks.push(nt);
+        byId.set(nt.taskId, true);
       }
     }
     plan = merged;
@@ -1114,7 +1222,7 @@ async function latestApplyPatchForTask(task) {
     const note = `\n\nLatest task: ${(task.title||task.description||'Task')} — ${new Date().toISOString()}`;
     ops.push({ op: content ? 'write' : 'add', path: 'README.md', content: content + note });
   }
-  return apiPost('/api/patch', { ops, meta: { taskId: task.taskId || task.id, title: rawTitle } });
+  return postPatch({ ops, meta: { taskId: task.taskId || task.id, title: rawTitle } });
 
   function scaffoldFor(p){
     const pn = String(p).toLowerCase();
@@ -1137,10 +1245,22 @@ async function latestApplyPatchForTask(task) {
   }
 }
 
+async function postPatch(body, tries = 6, delayMs = 250) {
+  for (let i = 0; i < tries; i++) {
+    try { return await apiPost('/api/patch', body); }
+    catch (e) {
+      const msg = String(e || '');
+      if (msg.includes('HTTP 423')) { await new Promise(r => setTimeout(r, delayMs)); continue; }
+      throw e;
+    }
+  }
+  return await apiPost('/api/patch', body);
+}
+
 async function latestRunQueue() {
   if (!v5Autopilot) return;
   clearTimers();
-  const queue = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE);
+  const queue = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE && t.status !== STATUS.REVERTED);
   if (!queue.length) {
     if (kanbanStatusEl) kanbanStatusEl.textContent = 'No pending tasks to execute.';
     addMessage({ who: 'agent', text: 'No pending tasks. I need to propose update tasks before I can apply a fix.' });
@@ -1151,7 +1271,10 @@ async function latestRunQueue() {
   startStatus('Applying patch…');
   try {
     const patchRes = await latestApplyPatchForTask(t);
-    if (patchRes && patchRes.snapshotId) v3Snapshots[t.taskId] = patchRes.snapshotId;
+    if (patchRes && patchRes.snapshotId) {
+      if (!Array.isArray(v3Snapshots[t.taskId])) v3Snapshots[t.taskId] = [];
+      v3Snapshots[t.taskId].push(patchRes.snapshotId);
+    }
     const changed = Array.isArray(patchRes.changes) ? patchRes.changes : [];
     const savedAbs = changed.map(c => (c.absPath || c.path)).map(p => ` - ${p}`).join('\n');
     const savedRel = changed.map(c => c.path).join(', ');

@@ -425,21 +425,84 @@ async function readEvents() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const { pathname, searchParams } = url;
+    let { pathname, searchParams } = url;
+    // Normalize: strip trailing slashes for routing
+    const pathClean = pathname.replace(/\/+$/,'') || '/';
   if (req.method === 'OPTIONS') {
       cors(res); res.statusCode = 204; return res.end();
     }
-    if (pathname.startsWith('/api/')) {
+    if (pathClean.startsWith('/api/')) {
       cors(res);
-      if (pathname === '/api/ping') {
-        return sendJSON(res, { ok: true, workspaceRoot: ROOT });
+      if (pathClean === '/api/ping') {
+      let gitEnabled = false, gitBranch = null;
+      try {
+        gitEnabled = isGitRepo();
+        if (gitEnabled) {
+          const out = await execGit('git rev-parse --abbrev-ref HEAD');
+          gitBranch = (out.stdout || '').trim();
+        }
+      } catch {}
+      return sendJSON(res, { ok: true, workspaceRoot: ROOT, gitEnabled, gitIntegrationOn: GIT_ENABLED, gitBranch });
+    }
+    if ((pathClean === '/api/revert/check' || pathClean === '/api/revert-check') && req.method === 'POST') {
+      const body = await readBody(req);
+      const snapshotId = String(body.snapshotId || '').trim();
+      if (!snapshotId) return sendJSON(res, { error: 'snapshotId required' }, 400);
+      const direction = (String(body.direction || 'before').toLowerCase() === 'after') ? 'after' : 'before';
+      const onlyPaths = Array.isArray(body.paths) ? body.paths.map(p => String(p).replace(/^\/+/, '')).filter(Boolean) : null;
+      const base = path.join(ROOT, '.vibe', 'snapshots', snapshotId);
+      const beforeDir = path.join(base, 'before');
+      const afterDir = path.join(base, 'after');
+      const hasBefore = await exists(beforeDir);
+      const hasAfter = await exists(afterDir);
+      if (!hasBefore && !hasAfter) return sendJSON(res, { error: 'snapshot not found' }, 404);
+      async function listFiles(dir) {
+        const out = [];
+        async function walk(d) {
+          const ents = await fsp.readdir(d, { withFileTypes: true });
+          for (const ent of ents) {
+            const fp = path.join(d, ent.name);
+            if (ent.isDirectory()) await walk(fp);
+            else if (ent.isFile()) out.push(path.relative(dir, fp).replace(/\\/g, '/'));
+          }
+        }
+        if (await exists(dir)) await walk(dir);
+        return out;
       }
-      if (pathname === '/api/debug' && req.method === 'GET') {
+      let beforeFiles = await listFiles(beforeDir);
+      let afterFiles = await listFiles(afterDir);
+      let allFiles = Array.from(new Set([...beforeFiles, ...afterFiles]));
+      if (onlyPaths && onlyPaths.length) {
+        const sel = new Set(onlyPaths);
+        allFiles = allFiles.filter(p => sel.has(p));
+      }
+      const warnings = [];
+      for (const rel of allFiles) {
+        const beforePath = path.join(beforeDir, rel);
+        const afterPath = path.join(afterDir, rel);
+        const workspacePath = safeJoin(rel);
+        const hadBefore = await exists(beforePath);
+        const hadAfter = await exists(afterPath);
+        const before = hadBefore ? await fsp.readFile(beforePath, 'utf8').catch(() => undefined) : undefined;
+        const after = hadAfter ? await fsp.readFile(afterPath, 'utf8').catch(() => undefined) : undefined;
+        try {
+          const cur = await fsp.readFile(workspacePath, 'utf8');
+          if (direction === 'before' && typeof after === 'string' && cur !== after) {
+            warnings.push({ path: rel, kind: 'diverged', note: 'Current file differs from snapshot-after; revert may overwrite subsequent edits.' });
+          }
+          if (direction === 'after' && typeof before === 'string' && cur !== before) {
+            warnings.push({ path: rel, kind: 'diverged', note: 'Current file differs from snapshot-before; reapply may overwrite prior state.' });
+          }
+        } catch {}
+      }
+      return sendJSON(res, { ok: true, snapshotId, warnings });
+    }
+      if (pathClean === '/api/debug' && req.method === 'GET') {
         const limit = Math.max(1, Math.min(50, Number(searchParams.get('limit') || '20')));
         const logs = DEBUG_LOGS.slice(-limit);
         return sendJSON(res, { logs, count: logs.length });
       }
-      if (pathname === '/api/agent/chat' && req.method === 'POST') {
+      if (pathClean === '/api/agent/chat' && req.method === 'POST') {
         const body = await readBody(req);
         const text = String(body.text || '').trim();
         if (!text) return sendJSON(res, { error: 'text required' }, 400);
@@ -681,7 +744,7 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, { provider: 'fallback', message, actions: [{ type: 'EMIT_PLAN', plan }] });
         }
       }
-      if (pathname === '/api/agent/plan' && req.method === 'POST') {
+      if (pathClean === '/api/agent/plan' && req.method === 'POST') {
         const body = await readBody(req);
         const goal = String(body.goal || '').trim();
         if (!goal) return sendJSON(res, { error: 'goal required' }, 400);
@@ -705,10 +768,12 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, { plan, provider: 'mock', error: String(e && e.message || e) });
         }
       }
-      if (pathname === '/api/revert' && req.method === 'POST') {
+      if (pathClean === '/api/revert' && req.method === 'POST') {
         const body = await readBody(req);
         const snapshotId = String(body.snapshotId || '').trim();
         if (!snapshotId) return sendJSON(res, { error: 'snapshotId required' }, 400);
+        const direction = (String(body.direction || 'before').toLowerCase() === 'after') ? 'after' : 'before';
+        const onlyPaths = Array.isArray(body.paths) ? body.paths.map(p => String(p).replace(/^\/+/, '')).filter(Boolean) : null;
         const base = path.join(ROOT, '.vibe', 'snapshots', snapshotId);
         const beforeDir = path.join(base, 'before');
         const afterDir = path.join(base, 'after');
@@ -730,53 +795,68 @@ const server = http.createServer(async (req, res) => {
           return out;
         }
 
-        const beforeFiles = await listFiles(beforeDir);
-        const afterFiles = await listFiles(afterDir);
-        const allFiles = Array.from(new Set([...beforeFiles, ...afterFiles]));
+        let beforeFiles = await listFiles(beforeDir);
+        let afterFiles = await listFiles(afterDir);
+        let allFiles = Array.from(new Set([...beforeFiles, ...afterFiles]));
+        if (onlyPaths && onlyPaths.length) {
+          const sel = new Set(onlyPaths);
+          allFiles = allFiles.filter(p => sel.has(p));
+        }
 
+        // For full-card revert to 'before', prefer git revert if applicable
+        if (!onlyPaths && direction === 'before') {
+          try {
+            if (GIT_ENABLED && isGitRepo()) {
+              const events = await readEvents();
+              const evt = events.find(e => e && e.type === 'PATCH_APPLIED' && e.data && e.data.snapshotId === snapshotId);
+              const hash = evt && evt.data && evt.data.commitHash;
+              if (hash) {
+                await execGit(`git revert --no-edit ${hash}`);
+                await appendEvent({ ts: Date.now(), type: 'GIT_REVERT', data: { snapshotId, hash } });
+                const restoredWithAbs = allFiles.map(rel => ({ path: rel, absPath: path.join(ROOT, rel) }));
+                return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, restored: restoredWithAbs, diff: `(git revert ${hash})` });
+              }
+            }
+          } catch (e) {
+            pushDebug({ ts: Date.now(), kind: 'git', action: 'revert_error', error: String(e && e.message || e) });
+          }
+        }
+
+        // Snapshot-based restore (full or partial; before or after)
         const changes = [];
         let combinedDiff = '';
-
+        const warnings = [];
         for (const rel of allFiles) {
           const beforePath = path.join(beforeDir, rel);
           const afterPath = path.join(afterDir, rel);
           const workspacePath = safeJoin(rel);
           const hadBefore = await exists(beforePath);
           const hadAfter = await exists(afterPath);
-          const before = hadBefore ? await fsp.readFile(beforePath, 'utf8') : undefined;
-          const after = hadAfter ? await fsp.readFile(afterPath, 'utf8') : undefined;
-          // Revert writes 'before' back; if before is undefined, delete file (it was added)
-          if (before !== undefined) {
-            await writeFileRecursive(workspacePath, before);
-            changes.push({ path: rel, action: (hadAfter && !hadBefore) ? 'create' : 'write' });
+          const before = hadBefore ? await fsp.readFile(beforePath, 'utf8').catch(() => undefined) : undefined;
+          const after = hadAfter ? await fsp.readFile(afterPath, 'utf8').catch(() => undefined) : undefined;
+          try {
+            const cur = await fsp.readFile(workspacePath, 'utf8');
+            if (direction === 'before' && typeof after === 'string' && cur !== after) {
+              warnings.push({ path: rel, kind: 'diverged', note: 'Current file differs from snapshot-after; revert may overwrite subsequent edits.' });
+            }
+          } catch {}
+          let writeContent;
+          if (direction === 'before') writeContent = before !== undefined ? before : '';
+          else writeContent = after !== undefined ? after : '';
+          if (writeContent !== undefined) {
+            await writeFileRecursive(workspacePath, writeContent);
           } else {
             await removeFile(workspacePath);
-            changes.push({ path: rel, action: 'delete' });
           }
-          combinedDiff += simpleUnifiedDiff(rel, after, before) + '\n';
+          changes.push({ path: rel });
+          const diff = direction === 'before' ? simpleUnifiedDiff(rel, after, before) : simpleUnifiedDiff(rel, before, after);
+          combinedDiff += diff + '\n';
         }
-
-        // Try git revert if applicable
-        let gitUsed = false;
-        try {
-          if (GIT_ENABLED && isGitRepo()) {
-            const events = await readEvents();
-            const evt = events.find(e => e && e.type === 'PATCH_APPLIED' && e.data && e.data.snapshotId === snapshotId);
-            const hash = evt && evt.data && evt.data.commitHash;
-            if (hash) {
-              await execGit(`git revert --no-edit ${hash}`);
-              gitUsed = true;
-              pushDebug({ ts: Date.now(), kind: 'git', action: 'revert', hash });
-            }
-          }
-        } catch (e) {
-          pushDebug({ ts: Date.now(), kind: 'git', action: 'revert_error', error: String(e && e.message || e) });
-        }
-        await appendEvent({ ts: Date.now(), type: gitUsed ? 'GIT_REVERT' : 'REVERT', data: { snapshotId, restored: changes } });
+        await appendEvent({ ts: Date.now(), type: direction === 'before' ? 'REVERT' : 'REAPPLY', data: { snapshotId, restored: changes, partial: !!(onlyPaths && onlyPaths.length) } });
         const restoredWithAbs = changes.map(c => ({ ...c, absPath: path.join(ROOT, c.path) }));
-        return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, restored: restoredWithAbs, diff: combinedDiff });
+        return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, restored: restoredWithAbs, diff: combinedDiff, warnings });
       }
-      if (pathname === '/api/patch' && req.method === 'POST') {
+      if (pathClean === '/api/patch' && req.method === 'POST') {
         if (PATCH_BUSY) {
           return sendJSON(res, { error: 'patch in progress, try again' }, 423);
         }
@@ -846,9 +926,9 @@ const server = http.createServer(async (req, res) => {
             if (GIT_ENABLED && isGitRepo()) {
               await gitEnsureRunBranch();
               // Stage files and commit
-              const filesToAdd = changes.map(c => c.path).map(p => `'${p.replace(/'/g, "'\\''")}'`).join(' ');
+              const filesToAdd = changes.map(c => c.path).map(p => `"${p.replace(/"/g, '\\"')}"`).join(' ');
               if (filesToAdd) {
-                await execGit(`git add ${filesToAdd}`);
+                await execGit(`git add -- ${filesToAdd}`);
                 const msg = `[ViBE] ${meta.title || 'Patch'} (snapshot ${snapshotId})`;
                 await execGit(`git commit -m ${JSON.stringify(msg)}`);
                 const out = await execGit('git rev-parse HEAD');
@@ -865,7 +945,7 @@ const server = http.createServer(async (req, res) => {
           PATCH_BUSY = false;
         }
       }
-      if (pathname === '/api/run' && req.method === 'POST') {
+      if (pathClean === '/api/run' && req.method === 'POST') {
         const body = await readBody(req);
         const kind = body.kind;
         const timeoutMs = Math.max(1000, Math.min(60_000, Number(body.timeoutMs || 10_000)));
@@ -907,7 +987,7 @@ const server = http.createServer(async (req, res) => {
         });
         return; // response handled in callback
       }
-      if (pathname === '/api/event' && req.method === 'POST') {
+      if (pathClean === '/api/event' && req.method === 'POST') {
         const body = await readBody(req);
         const type = String(body.type || '').trim();
         const data = body.data || {};
@@ -916,11 +996,11 @@ const server = http.createServer(async (req, res) => {
         await appendEvent(evt);
         return sendJSON(res, { ok: true });
       }
-      if (pathname === '/api/events' && req.method === 'GET') {
+      if (pathClean === '/api/events' && req.method === 'GET') {
         const list = await readEvents();
         return sendJSON(res, { events: list });
       }
-      if (pathname === '/api/tree') {
+      if (pathClean === '/api/tree') {
         const userPath = searchParams.get('path') || '.';
         const depth = Math.max(0, Math.min(5, Number(searchParams.get('depth') || '2')));
         const full = safeJoin(userPath);
@@ -929,7 +1009,7 @@ const server = http.createServer(async (req, res) => {
         const out = await listTree(full, depth);
         return sendJSON(res, { root: path.relative(ROOT, full).replace(/\\/g, '/') || '.', depth, entries: out });
       }
-      if (pathname === '/api/file') {
+      if (pathClean === '/api/file') {
         const userPath = searchParams.get('path');
         if (!userPath) return sendJSON(res, { error: 'path required' }, 400);
         const full = safeJoin(userPath);
@@ -938,7 +1018,7 @@ const server = http.createServer(async (req, res) => {
         const { size, content } = await readTextFile(full);
         return sendJSON(res, { path: userPath, size, content });
       }
-      if (pathname === '/api/search') {
+      if (pathClean === '/api/search') {
         const q = (searchParams.get('q') || '').trim();
         if (!q) return sendJSON(res, { error: 'q required' }, 400);
         const max = Math.max(1, Math.min(200, Number(searchParams.get('max') || '50')));

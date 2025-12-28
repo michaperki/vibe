@@ -11,6 +11,7 @@
       <div class="brand">ViBE</div>
       <div class="subtitle" id="subtitle">Latest — Real Planning + Controlled Execution</div>
       <div class="workspace-info" id="workspaceInfo" title="Workspace root"></div>
+      <span id="gitTag" class="tiny-tag" title="Git integration state"></span>
       <div class="controls">
         <div class="mode-toggle" aria-label="Mode"></div>
         <button id="btnAutopilot" class="auto-btn" title="Autopilot toggles agent pacing">Autopilot: On</button>
@@ -60,7 +61,7 @@
 
       <!-- Evidence Pane -->
       <section class="pane evidence-pane">
-        <div class="pane-header">Evidence <button id="btnPreviewDiff" class="preview-btn" title="Open diff preview">Preview Diff</button> <button id="btnRevertCard" class="revert-btn" title="Revert this card" disabled>Revert Card</button></div>
+        <div class="pane-header">Evidence <button id="btnPreviewDiff" class="preview-btn" title="Open diff preview">Preview Diff</button> <button id="btnRevertCard" class="revert-btn hide" title="Revert this card" disabled>Revert Card</button> <button id="btnReapplyCard" class="revert-btn hide" style="background:#35c759;color:#00140a;" title="Reapply this card" disabled>Reapply Card</button></div>
         <div class="tabs" role="tablist">
           <button role="tab" aria-selected="true" class="tab active" data-tab="diff">Diff</button>
           <button role="tab" aria-selected="false" class="tab" data-tab="logs">Logs</button>
@@ -86,6 +87,8 @@
           <div class="modal-title">Diff Preview</div>
           <div class="modal-actions">
             <select id="modalFileSelect" class="modal-select" title="Select file"></select>
+            <button id="modalRevertFile" class="modal-btn" title="Revert selected file">Revert File</button>
+            <button id="modalReapplyFile" class="modal-btn" title="Reapply selected file">Reapply File</button>
             <button id="modalCopy" class="modal-btn" title="Copy diff">Copy</button>
             <button id="modalClose" class="modal-btn" title="Close">Close</button>
           </div>

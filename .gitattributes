@@ -1,0 +1,16 @@
+# Enforce consistent LF endings in the repo and working tree
+* text=auto eol=lf
+
+# Windows-specific scripts can opt-in to CRLF if added later
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Treat common binary assets as binary (no EOL normalization)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+
