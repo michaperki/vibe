@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ViBE — Kanban Agent (Latest)</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">ViBE</div>
+      <div class="subtitle" id="subtitle">Latest — Real Planning + Controlled Execution</div>
+      <div class="workspace-info" id="workspaceInfo" title="Workspace root"></div>
+      <div class="controls">
+        <div class="mode-toggle" aria-label="Mode"></div>
+        <button id="btnAutopilot" class="auto-btn" title="Autopilot toggles agent pacing">Autopilot: On</button>
+        <button id="btnDevTools" class="reset-btn" title="Open developer tools">Dev Tools</button>
+        <button id="btnChangeWorkspace" class="reset-btn" title="How to change workspace">Change Workspace</button>
+        <button id="btnReset" class="reset-btn" title="Reset run">Reset</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- Chat Pane -->
+      <section class="pane chat-pane">
+        <div class="pane-header">Chat</div>
+        <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
+        <form id="chatForm" class="chat-input" autocomplete="off">
+          <input id="chatText" type="text" placeholder="Describe what you want to build…" aria-label="Chat input" />
+          <button type="submit" title="Send">Send</button>
+        </form>
+      </section>
+
+      <!-- Kanban Pane -->
+      <section class="pane kanban-pane">
+        <div class="pane-header">Kanban <span id="kanbanStatus" class="kanban-status"></span></div>
+        <div class="kanban">
+          <div class="kanban-col" data-col="PLANNED">
+            <div class="kanban-col-title">Planned</div>
+            <div class="kanban-list" id="col-planned"></div>
+          </div>
+          <div class="kanban-col" data-col="EXECUTING">
+            <div class="kanban-col-title">Executing</div>
+            <div class="kanban-list" id="col-executing"></div>
+          </div>
+          <div class="kanban-col" data-col="VERIFYING">
+            <div class="kanban-col-title">Verifying</div>
+            <div class="kanban-list" id="col-verifying"></div>
+          </div>
+          <div class="kanban-col" data-col="NEEDS_INPUT">
+            <div class="kanban-col-title">Needs Input</div>
+            <div class="kanban-list" id="col-needs"></div>
+          </div>
+          <div class="kanban-col" data-col="DONE">
+            <div class="kanban-col-title">Done</div>
+            <div class="kanban-list" id="col-done"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Evidence Pane -->
+      <section class="pane evidence-pane">
+        <div class="pane-header">Evidence <button id="btnPreviewDiff" class="preview-btn" title="Open diff preview">Preview Diff</button> <button id="btnRevertCard" class="revert-btn" title="Revert this card" disabled>Revert Card</button></div>
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" class="tab active" data-tab="diff">Diff</button>
+          <button role="tab" aria-selected="false" class="tab" data-tab="logs">Logs</button>
+          <button role="tab" aria-selected="false" class="tab" data-tab="tests">Tests</button>
+          <button role="tab" aria-selected="false" class="tab" data-tab="plan">Plan</button>
+          <button role="tab" aria-selected="false" class="tab" data-tab="memory">Memory</button>
+        </div>
+        <div class="tab-panels">
+          <pre id="tab-diff" class="tab-panel code active" aria-label="Diff"></pre>
+          <pre id="tab-logs" class="tab-panel code" aria-label="Logs"></pre>
+          <pre id="tab-tests" class="tab-panel code" aria-label="Tests"></pre>
+          <pre id="tab-plan" class="tab-panel code" aria-label="Plan JSON"></pre>
+          <pre id="tab-memory" class="tab-panel code" aria-label="Memory"></pre>
+        </div>
+      </section>
+    </main>
+
+    <!-- Diff Preview Modal -->
+    <div id="diffModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Diff Preview">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Diff Preview</div>
+          <div class="modal-actions">
+            <select id="modalFileSelect" class="modal-select" title="Select file"></select>
+            <button id="modalCopy" class="modal-btn" title="Copy diff">Copy</button>
+            <button id="modalClose" class="modal-btn" title="Close">Close</button>
+          </div>
+        </div>
+        <pre id="modalBody" class="code" tabindex="0"></pre>
+      </div>
+    </div>
+
+    <!-- Change Workspace Modal -->
+    <div id="wsModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Change Workspace">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Change Workspace</div>
+          <div class="modal-actions">
+            <button id="wsClose" class="modal-btn" title="Close">Close</button>
+          </div>
+        </div>
+        <div class="code" style="padding:12px;">
+          <p>The workspace is the folder where ViBE writes code. To switch, start ViBE from the target folder or pass a path to the launcher:</p>
+          <pre id="wsCommand" class="code" style="white-space:pre-wrap"></pre>
+          <button id="wsCopy" class="modal-btn" title="Copy command">Copy Command</button>
+          <p style="color:#9aa7b4">Current: <span id="wsCurrent"></span></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dev Tools Modal -->
+    <div id="devModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Developer Tools">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Developer Tools</div>
+          <div class="modal-actions">
+            <label style="margin-right:8px; font-size:12px; color:#9aa7b4; display:flex; align-items:center; gap:6px;">
+              <input id="devTailToggle" type="checkbox" /> Tail
+            </label>
+            <button id="devRefresh" class="modal-btn" title="Refresh logs">Refresh</button>
+            <button id="devCopy" class="modal-btn" title="Copy logs">Copy</button>
+            <button id="devClose" class="modal-btn" title="Close">Close</button>
+          </div>
+        </div>
+        <pre id="devBody" class="code" tabindex="0" aria-label="Debug logs" style="max-height:60vh; overflow:auto;"></pre>
+      </div>
+    </div>
+
+    <footer class="app-footer">
+      <span>Agent owns the board</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+  </html>

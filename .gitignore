@@ -1,0 +1,26 @@
+# Node / tooling
+node_modules/
+dist/
+build/
+coverage/
+npm-debug.log*
+yarn-error.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ViBE runtime
+.vibe/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+
+# Local demos and throwaway experiments
+demos/
