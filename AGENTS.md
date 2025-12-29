@@ -42,19 +42,25 @@ Server Endpoints (selected)
 - `GET /api/file?path=...` → read a file (bounded). Optional byte-range params: `head`, `tail`, or `start`/`end`; optional `maxBytes` cap.
 - `GET /api/search?q=...` → search text. Optional `regex=1`, `case=sensitive`, and `context=N` (±N lines).
 - `POST /api/patch` → atomic text writes with snapshots; returns combined diff
-- `POST /api/patch/diff { diff, keepRegions?, preview? }` → apply unified diff with keep‑regions and snapshots; returns per‑file diffs and warnings. Prefer this for edits.
+- `POST /api/patch/diff { diff, keepRegions?, preview? }` → apply unified diff with keep‑regions and snapshots; returns per‑file diffs and warnings. Prefer this for edits. When applied (not preview), a combined diff is saved under `.vibe/logs/` and returned as `diffPath`.
+- `POST /api/diff/generate { path, newContent, oldContent? }` → returns a minimal unified diff for the given file.
 - `POST /api/revert` → restore a snapshot (per-card revert)
 - `POST /api/revert/check` → get divergence warnings before revert/reapply
-- `POST /api/run { kind: "test", confirm?: true }` → runs `npm test` if present (optionally gated)
+- `POST /api/run { kind: "test", confirm?: true }` → runs `npm test` if present (optionally gated). Full logs are saved under `.vibe/logs/` and response includes `logPath` and `last` (tail).
 - `POST /api/agent/plan { goal }` → plan JSON via OpenAI (fallback deterministic if missing)
 - `POST /api/agent/chat { text, history?, client? }` → action-oriented chat (READ/CREATE/UPDATE/PLAN/PROCEED etc.)
 - `POST /api/wrapup { summary }` → returns concise run wrap‑up (OpenAI if configured)
+- `GET /api/skills/list` → list available skills in `skills/`
+- `POST /api/diff/generate { path, newContent, oldContent? }` → generate unified diff for edits
 
 Action Schema (expectations)
 - READ_FILE `{ path }`
 - EDIT_DIFF `{ diff, keepRegions? }` (preferred for edits; unified diff)
 - CREATE_FILE `{ path, content }` (full file content for new files)
 - UPDATE_FILE `{ path, content }` (use sparingly; prefer EDIT_DIFF when possible)
+- UPDATE_MEMORY `{ kind, diff }` (maps to EDIT_DIFF on repo memory files; kinds: PLAN, DECISIONS, CURRENT_TASK, TODO, NOTES, ARCHITECTURE)
+- TASK `{ kind, ... }` (fresh-context sub-agents; supported kinds: `SCOUT { q, dir?, ext? }`, `TEST { timeoutMs? }`). Returns observations and log pointers; results are folded into the next planning step.
+- LOAD_SKILL `{ name }` (injects the skill doc into context for the next step; equivalent to user selecting a skill)
 - EMIT_PLAN `{ plan }`, REPLAN `{ plan }`
 - PROCEED_EXECUTION | HALT_EXECUTION | PLAN_ONLY | ASK_INPUT
 – Optional: META `{ risk, assumptions }` attached to card evidence
@@ -76,7 +82,10 @@ Repo Layout (after cleanup)
 - `server.js`, `vibe.js` — minimal server + CLI workspace launcher
 - `demos/` — archived demo apps and experiments
 - `.vibe/` — snapshots + events (ignored in VCS)
-- `PLAN.md`, `SEED.md`, `context-dumps/` — product intent and iteration notes
+- `PLAN.md`, `DECISIONS.md`, `CURRENT_TASK.md`, `TODO.md`, `NOTES.md`, `ARCHITECTURE.md` — files-as-memory consulted by the agent
+- `tasks/` — per-task overlays (`<slug>.md`) created when a task begins execution
+- `skills/` — loadable skill bundles (`.md`) injected on demand
+- `SEED.md`, `context-dumps/` — product intent and iteration notes
 - `AGENTS.md` — this file (repo-wide)
 
 Do’s and Don’ts for Agents

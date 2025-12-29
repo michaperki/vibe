@@ -50,6 +50,9 @@ try {
 const PORT = process.env.PORT ? Number(process.env.PORT) : 7080;
 const IGNORE = new Set(['.git', 'node_modules', '.next', 'dist', 'build', 'coverage', '.cache']);
 const VIBE_DIR = path.join(ROOT, '.vibe');
+const LOGS_DIR = path.join(VIBE_DIR, 'logs');
+// Serve UI assets from the installed package directory (not the workspace root)
+const UI_DIR = __dirname;
 const EVENTS_FILE = path.join(VIBE_DIR, 'events.json');
 const CONFIG_FILE = path.join(VIBE_DIR, 'config.json');
 // In-memory debug ring buffer (non-persistent)
@@ -101,16 +104,56 @@ function sanitizeMessages(msgs, maxLen = 2000) {
     }));
   } catch { return []; }
 }
+function normalizeActions(actions) {
+  try {
+    const out = [];
+    for (const a of (actions || [])) {
+      if (!a) continue;
+      if (typeof a === 'string') { out.push({ type: String(a).toUpperCase() }); continue; }
+      if (typeof a === 'object') {
+        const type = String(a.type || a.action || a.kind || a.tool || '').toUpperCase();
+        const obj = { ...a, type };
+        if (obj.params && typeof obj.params === 'object') {
+          const p = obj.params;
+          if (obj.path == null && typeof p.path === 'string') obj.path = p.path;
+          if (obj.dir == null && typeof p.dir === 'string') obj.dir = p.dir;
+          if (obj.depth == null && (p.depth !== undefined)) obj.depth = p.depth;
+          if (obj.q == null && typeof p.q === 'string') obj.q = p.q;
+        }
+        // Flatten nested one-off operations like UPDATE_FILE/CREATE_FILE/EDIT_DIFF embedded as objects
+        const nested = [];
+        for (const k of Object.keys(a)) {
+          const K = k.toUpperCase();
+          const v = a[k];
+          if (!v || typeof v !== 'object') continue;
+          if (K === 'EDIT_DIFF' && typeof v.diff === 'string') nested.push({ type: 'EDIT_DIFF', diff: v.diff });
+          if ((K === 'UPDATE_FILE' || K === 'CREATE_FILE') && typeof v.path === 'string' && typeof v.content === 'string') {
+            nested.push({ type: K, path: v.path, content: v.content });
+          }
+        }
+        out.push(obj);
+        for (const n of nested) out.push(n);
+      }
+    }
+    return out;
+  } catch { return Array.isArray(actions) ? actions : []; }
+}
 function validateActionsStrict(actions) {
-  const allowed = new Set(['READ_FILE','READ','VIEW_FILE','OPEN_FILE','READ_TREE','SEARCH','CREATE_FILE','CREATE_FILE_BINARY','UPDATE_FILE','CREATE_DIR','EDIT_DIFF','EMIT_PLAN','REPLAN','PROCEED_EXECUTION','HALT_EXECUTION','PLAN_ONLY','ASK_INPUT']);
+  const allowed = new Set(['READ_FILE','READ','VIEW_FILE','OPEN_FILE','READ_TREE','SEARCH','CREATE_FILE','CREATE_FILE_BINARY','UPDATE_FILE','CREATE_DIR','EDIT_DIFF','EMIT_PLAN','REPLAN','PROCEED_EXECUTION','HALT_EXECUTION','PLAN_ONLY','ASK_INPUT','TASK','UPDATE_MEMORY','LOAD_SKILL']);
   const errs = [];
   for (const a of (actions||[])) {
     if (!a) { errs.push('null action'); continue; }
-    const typ = String(a.type || a.action || '').toUpperCase();
+    const typ = String(a.type || a.action || a.kind || '').toUpperCase();
     if (!typ) { errs.push('missing type'); continue; }
     if (!allowed.has(typ)) { errs.push(`unknown type ${typ}`); continue; }
     if ((typ === 'CREATE_FILE' || typ === 'UPDATE_FILE') && (typeof a.path !== 'string' || a.path.trim() === '' || typeof a.content !== 'string')) {
       errs.push(`${typ} requires path and content`);
+    }
+    if (typ === 'UPDATE_MEMORY') {
+      if (!a.kind || typeof a.diff !== 'string' || !a.diff.trim()) errs.push('UPDATE_MEMORY requires kind and diff');
+    }
+    if (typ === 'TASK') {
+      if (!a.kind) errs.push('TASK requires kind');
     }
     if (typ === 'CREATE_FILE_BINARY') {
       const hasB64 = (typeof a.base64 === 'string') || (typeof a.contentBase64 === 'string');
@@ -157,7 +200,7 @@ function summarizeEvents(events, maxFiles = 5) {
 const REQUIRED_CONTENT_TYPES = new Set(['CREATE_FILE', 'UPDATE_FILE']);
 function toActionRecord(a) {
   if (!a) return null;
-  const type = String(a.type || a.action || a.tool || '').toUpperCase();
+  const type = String(a.type || a.action || a.kind || a.tool || '').toUpperCase();
   if (!type) return null;
   const pathLike = a.path || a.file || a.name || null;
   const content = a.content !== undefined ? String(a.content) : undefined;
@@ -345,10 +388,15 @@ async function searchRepo(start, q, maxMatches = 50, maxFileSize = 1_000_000, ex
   return matches;
 }
 
+function safeJoinUI(p) {
+  const full = path.normalize(path.join(UI_DIR, p));
+  if (!full.startsWith(UI_DIR)) throw new Error('Path traversal (ui)');
+  return full;
+}
 function serveStatic(req, res, pathname) {
   let p = decodeURIComponent(pathname);
   if (p === '/') p = '/index.html';
-  const full = safeJoin(p.replace(/^\//, ''));
+  const full = safeJoinUI(p.replace(/^\//, ''));
   fs.readFile(full, (err, data) => {
     if (err) {
       send(res, 404, 'Not Found', 'text/plain; charset=utf-8');
@@ -382,6 +430,15 @@ async function ensureDir(dir) { await fsp.mkdir(dir, { recursive: true }); }
 async function writeFileRecursive(fp, content) {
   await ensureDir(path.dirname(fp));
   await fsp.writeFile(fp, content, 'utf8');
+}
+
+async function writeLogFile(basename, content) {
+  try {
+    await ensureDir(LOGS_DIR);
+    const fp = path.join(LOGS_DIR, basename);
+    await fsp.writeFile(fp, String(content || ''), 'utf8');
+    return fp;
+  } catch { return null; }
 }
 
 async function removeFile(fp) {
@@ -435,6 +492,32 @@ function simpleUnifiedDiff(relPath, before, after) {
     if (la !== undefined) aLine++;
     if (lb !== undefined) bLine++;
   }
+  return out.join('\n');
+}
+
+// Generate a basic, valid unified diff that replaces the entire file content.
+// This is conservative (no context hunks), but applies reliably when based on current content.
+function fullReplaceUnifiedDiff(relPath, before, after) {
+  const a = (before != null ? String(before) : '').split(/\r?\n/);
+  const b = (after != null ? String(after) : '').split(/\r?\n/);
+  const aCount = a.length && !(a.length === 1 && a[0] === '') ? a.length : 0;
+  const bCount = b.length && !(b.length === 1 && b[0] === '') ? b.length : 0;
+  // Added file
+  if (aCount === 0 && bCount > 0) {
+    const out = [`--- /dev/null`, `+++ b/${relPath}`, `@@ -0,0 +1,${bCount} @@`];
+    for (const line of b) { if (line !== '' || bCount > 0) out.push(`+${line}`); }
+    return out.join('\n');
+  }
+  // Deleted file
+  if (aCount > 0 && bCount === 0) {
+    const out = [`--- a/${relPath}`, `+++ /dev/null`, `@@ -1,${aCount} +0,0 @@`];
+    for (const line of a) { if (line !== '' || aCount > 0) out.push(`-${line}`); }
+    return out.join('\n');
+  }
+  // Modified or empty-to-empty
+  const out = [`--- a/${relPath}`, `+++ b/${relPath}`, `@@ -1,${aCount} +1,${bCount} @@`];
+  for (const line of a) { if (aCount > 0) out.push(`-${line}`); }
+  for (const line of b) { if (bCount > 0) out.push(`+${line}`); }
   return out.join('\n');
 }
 
@@ -588,7 +671,8 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, { logs, count: logs.length });
       }
       if (pathClean === '/api/agent/chat' && req.method === 'POST') {
-        const body = await readBody(req);
+        let body;
+        try { body = await readBody(req); } catch (e) { console.error('chat body parse error:', e && e.stack || e); return sendJSON(res, { error: 'invalid JSON body' }, 400); }
         const text = String(body.text || '').trim();
         if (!text) return sendJSON(res, { error: 'text required' }, 400);
         const tree = await listTree(ROOT, 1);
@@ -597,7 +681,10 @@ const server = http.createServer(async (req, res) => {
         const client = body.client || {};
         const pendingCount = Number.isFinite(Number(client.pendingCount)) ? Number(client.pendingCount) : null;
         const activeDirFromClient = typeof client.activeDir === 'string' && client.activeDir.trim() ? client.activeDir.trim() : null;
+        const overlayRelFromClient = typeof client.overlay === 'string' && client.overlay.trim() ? client.overlay.trim() : null;
         const autopilotOn = !!client.autopilot;
+        const clientSkills = Array.isArray(client.skills) ? client.skills.map(s => String(s).trim()).filter(Boolean) : [];
+        const handoff = !!body.handoff;
         const clientPerms = client.perms || {};
         const ALLOW_READ = !!clientPerms.read;
         const ALLOW_WRITE = !!clientPerms.write;
@@ -668,6 +755,66 @@ const server = http.createServer(async (req, res) => {
             const b = lines.slice(-tail);
             return a.join('\n') + `\n... (snipped ${lines.length - head - tail} lines) ...\n` + b.join('\n');
           }
+          // If a README exists at root, include a short excerpt in guidance to bias the model to read it
+          try {
+            const readmeCandidates = ['README.md','Readme.md','readme.md'];
+            for (const rname of readmeCandidates) {
+              const rfull = path.join(ROOT, rname);
+              if (await exists(rfull)) {
+                const r = await readTextFile(rfull, 40_000);
+                guidance.push('Context: README.md (excerpt):');
+                guidance.push(headTail(r.content, 80, 40));
+                break;
+              }
+            }
+          } catch {}
+          // Skills: inject selected skills (client-provided) as context headers (excerpt)
+          try {
+            if (clientSkills.length) {
+              const dir = path.join(ROOT, 'skills');
+              for (const name of clientSkills.slice(0, 6)) {
+                const fp = path.join(dir, `${name.replace(/[^a-z0-9_\-]/gi,'')}.md`);
+                if (await exists(fp)) {
+                  const r = await readTextFile(fp, 40_000);
+                  guidance.push(`Skill: ${name}`);
+                  guidance.push(headTail(r.content, 80, 40));
+                }
+              }
+            }
+          } catch {}
+          // Handoff: prefer session summary at start of fresh session
+          try {
+            if (handoff) {
+              const sess = path.join(ROOT, 'SESSION_SUMMARY.md');
+              if (await exists(sess)) {
+                const r = await readTextFile(sess, 60_000);
+                guidance.push('Handoff: SESSION_SUMMARY.md (excerpt):');
+                guidance.push(headTail(r.content, 120, 60));
+              }
+            }
+          } catch {}
+          // Files-as-memory: inject excerpts from repo memory docs if present
+          try {
+            const memNames = ['PLAN.md','DECISIONS.md','CURRENT_TASK.md','TODO.md','NOTES.md','ARCHITECTURE.md'];
+            for (const m of memNames) {
+              const fp = path.join(ROOT, m);
+              if (await exists(fp)) {
+                const r = await readTextFile(fp, 40_000);
+                guidance.push(`Context: ${m} (excerpt):`);
+                guidance.push(headTail(r.content, 60, 30));
+              }
+            }
+          } catch {}
+          if (overlayRelFromClient) {
+            try {
+              const fp = safeJoin(overlayRelFromClient);
+              if (await exists(fp)) {
+                const r = await readTextFile(fp, 40_000);
+                guidance.push(`Context: ${overlayRelFromClient} (excerpt):`);
+                guidance.push(headTail(r.content, 80, 40));
+              }
+            } catch {}
+          }
           if (candidates.length) {
             const slim = [];
             for (const f of candidates) { slim.push(`FILE: ${f.rel}`); slim.push(headTail(f.content)); slim.push('---'); }
@@ -676,7 +823,7 @@ const server = http.createServer(async (req, res) => {
           }
           let out = await openaiChat(text, summary, history, { extraSystem: (extraSystem + (memoryLine ? ('\n' + memoryLine) : '')) });
           let message = String(out.message || '').trim() || '...';
-          let actions = Array.isArray(out.actions) ? out.actions : [];
+          let actions = normalizeActions(Array.isArray(out.actions) ? out.actions : []);
           // Validate structure and required fields; short bounded tool loop with one retry for missing content
           let basic = validateActionsBasic(actions);
           if (basic.missingContent.length) {
@@ -699,20 +846,23 @@ const server = http.createServer(async (req, res) => {
             ].join(' ');
             const forced = await openaiChat(text, summary, history, { forceActions: true, extraSystem: extraForce + (memoryLine ? ('\n' + memoryLine) : '') });
             message = String(forced.message || '').trim() || message;
-            actions = Array.isArray(forced.actions) ? forced.actions : [];
+            actions = normalizeActions(Array.isArray(forced.actions) ? forced.actions : []);
           }
 
-          // Lightweight tool loop: honor READ_FILE / READ_TREE / SEARCH before proceeding
+          // Lightweight tool loop: honor READ_FILE / READ_TREE / SEARCH before proceeding (plus TASK sub-agents and UPDATE_MEMORY mapping)
           const readAliases = new Set(['READ_FILE', 'READ', 'VIEW_FILE', 'OPEN_FILE']);
           let safetyCounter = 0;
           let obsExtra = '';
+          let performedReadTree = false;
+          let performedReadReadme = false;
           while (safetyCounter < 2) {
             const reads = [];
             const trees = [];
             const searches = [];
+            const tasksList = [];
             for (const a of actions) {
               if (!a) continue;
-              const typ = String(a.type || a.action || '').toUpperCase();
+              const typ = String(a.type || a.action || a.kind || '').toUpperCase();
               if (readAliases.has(typ)) {
                 const p = a.path || a.file || a.name;
                 if (typeof p === 'string' && p.trim()) reads.push(p.trim());
@@ -731,13 +881,32 @@ const server = http.createServer(async (req, res) => {
                 const regex = !!a.regex;
                 if (q) searches.push({ q, dir, max, context, caseSensitive, regex, ext: a.ext || null });
               }
+              if (typ === 'TASK') {
+                const kind = String(a.kind || '').toUpperCase();
+                tasksList.push({ kind, a });
+              }
+              if (typ === 'LOAD_SKILL') {
+                const name = (a.name || a.skill || '').trim();
+                if (name) tasksList.push({ kind: 'LOAD_SKILL', a: { name } });
+              }
               // Support batch reads if model provides a.paths
               if (Array.isArray(a.paths)) {
                 for (const p of a.paths) { if (typeof p === 'string' && p.trim()) reads.push(p.trim()); }
               }
               
             }
-            if (!reads.length && !trees.length && !searches.length) break;
+            if (!reads.length && !trees.length && !searches.length) {
+              // Nudge: if no read actions yet, encourage model to READ_TREE and READ_FILE README.md first
+              if (safetyCounter === 0) {
+                obsExtra += '\nPolicy: Before creating scaffolds or directories, call READ_TREE { dir: ".", depth: 2 } and READ_FILE { path: "README.md" } if present, then propose a plan.';
+                const re2 = await openaiChat(text, summary, history, { extraSystem: (extraSystem + obsExtra + (memoryLine ? ('\n' + memoryLine) : '')), forceActions: true });
+                message = String(re2.message || '').trim() || message;
+                actions = normalizeActions(Array.isArray(re2.actions) ? re2.actions : []);
+                safetyCounter++;
+                continue;
+              }
+              break;
+            }
             const seen = new Set();
             for (const rel of reads) {
               try {
@@ -749,6 +918,7 @@ const server = http.createServer(async (req, res) => {
                 if (!ok) { obsExtra += `\nObservation: READ_FILE ${norm} → not found`; continue; }
                 const { size, content } = await readTextFile(full, 60_000);
                 obsExtra += `\nObservation: FILE ${norm} (size=${size})\n${content}\n---`;
+                if (/^readme\.md$/i.test(path.basename(norm))) performedReadReadme = true;
               } catch (e) {
                 obsExtra += `\nObservation: READ_FILE error for ${rel}: ${String(e && e.message || e)}`;
               }
@@ -760,6 +930,7 @@ const server = http.createServer(async (req, res) => {
                 const ent = await listTree(root, Number(t.depth || 2));
                 const lines = ent.slice(0, 200).map(e => `${e.type}:${e.path}${e.type==='file'?` (${e.size}b)`:''}`);
                 obsExtra += `\nObservation: TREE dir=${t.dir} depth=${t.depth}\n${lines.join('\n')}\n---`;
+                performedReadTree = true;
               } catch (e) {
                 obsExtra += `\nObservation: READ_TREE error for ${String(t.dir)}: ${String(e && e.message || e)}`;
               }
@@ -775,11 +946,66 @@ const server = http.createServer(async (req, res) => {
                 obsExtra += `\nObservation: SEARCH error for ${String(s.q)}: ${String(e && e.message || e)}`;
               }
             }
-            
+            // TASK sub-agents (SCOUT / TEST) and LOAD_SKILL injection
+            for (const t of tasksList) {
+              const kind = t.kind;
+              if (kind === 'SCOUT') {
+                try {
+                  const q = (t.a.q || t.a.query || '').trim();
+                  const dir = (t.a.dir || '.');
+                  const root = safeJoin(dir);
+                  const found = q ? (await searchRepo(root, q, 200, 1_000_000, t.a.ext || null, { regex: !!t.a.regex, caseSensitive: !!t.a.caseSensitive, context: 1 })) : [];
+                  const lines = found.slice(0, 100).map(m => `${m.path}:${m.line}: ${m.text}`);
+                  const logName = `scout-${Date.now()}.txt`;
+                  const fp = await writeLogFile(logName, lines.join('\n'));
+                  const rel = fp ? path.relative(ROOT, fp).replace(/\\/g, '/') : null;
+                  obsExtra += `\nObservation: TASK SCOUT q=${q||'(none)'} matches=${found.length}${rel?` log=${rel}`:''}`;
+                } catch (e) {
+                  obsExtra += `\nObservation: TASK SCOUT error: ${String(e && e.message || e)}`;
+                }
+              } else if (kind === 'TEST') {
+                try {
+                  const requireConfirm = String(process.env.VIBE_REQUIRE_TEST_CONFIRM || '').trim() === '1';
+                  if (!ALLOW_TEST || requireConfirm) { obsExtra += `\nObservation: TASK TEST denied: permission/confirm required`; continue; }
+                  const timeoutMs = Math.max(1000, Math.min(60_000, Number(t.a.timeoutMs || 10_000)));
+                  const isWin = process.platform === 'win32';
+                  const cmd = isWin ? 'npm.cmd test --silent' : 'npm test --silent';
+                  const { exec } = require('child_process');
+                  const out = await new Promise((resolve) => {
+                    exec(cmd, { cwd: ROOT, timeout: timeoutMs }, (err, stdout, stderr) => {
+                      resolve({ err, stdout, stderr });
+                    });
+                  });
+                  const combined = String(out.stdout||'') + (out.stderr?`\n[stderr]\n${out.stderr}`:'');
+                  const name = `task-test-${Date.now()}.txt`;
+                  const fp = await writeLogFile(name, combined);
+                  const rel = fp ? path.relative(ROOT, fp).replace(/\\/g, '/') : null;
+                  const lines = combined.split(/\r?\n/).slice(-50).join('\n');
+                  const ok = !out.err;
+                  obsExtra += `\nObservation: TASK TEST ok=${ok}${rel?` log=${rel}`:''}\n${lines}`;
+                } catch (e) {
+                  obsExtra += `\nObservation: TASK TEST error: ${String(e && e.message || e)}`;
+                }
+              } else if (kind === 'LOAD_SKILL') {
+                try {
+                  const dir = path.join(ROOT, 'skills');
+                  const fp = path.join(dir, `${String(t.a.name||'').replace(/[^a-z0-9_\-]/gi,'')}.md`);
+                  if (await exists(fp)) {
+                    const r = await readTextFile(fp, 40_000);
+                    obsExtra += `\nObservation: LOAD_SKILL ${t.a.name}\n${headTail(r.content, 80, 40)}`;
+                  } else {
+                    obsExtra += `\nObservation: LOAD_SKILL ${t.a.name} not found`;
+                  }
+                } catch (e) {
+                  obsExtra += `\nObservation: LOAD_SKILL error: ${String(e && e.message || e)}`;
+                }
+              }
+            }
+
             // Ask the model again with observations appended; expect concrete actions (e.g., UPDATE_FILE)
             const re = await openaiChat(text, summary, history, { extraSystem: (extraSystem + obsExtra + (memoryLine ? ('\n' + memoryLine) : '')), forceActions: true });
             message = String(re.message || '').trim() || message;
-            actions = Array.isArray(re.actions) ? re.actions : [];
+            actions = normalizeActions(Array.isArray(re.actions) ? re.actions : []);
             safetyCounter++;
           }
 
@@ -798,6 +1024,43 @@ const server = http.createServer(async (req, res) => {
             .map(toActionRecord)
             .filter(Boolean);
           const isToolPlan = toolActs.some(r => /^(CREATE_|UPDATE_|MODIFY_|WRITE_|APPEND_|EDIT_|REPLACE_|CREATE_DIR|CREATE_FILE|UPDATE_FILE|EDIT_DIFF)$/.test(r.type));
+          // Enforce read-before-write: require at least READ_TREE or READ_FILE README.md before writes
+          if (isToolPlan && !(performedReadTree || performedReadReadme)) {
+            const guardMsg = 'Policy: Read-first guard — before proposing writes, call READ_TREE { dir: ".", depth: 2 } and READ_FILE { path: "README.md" } if present, then propose actions.';
+            try {
+              const forced = await openaiChat(text, summary, Array.isArray(body.history)?body.history:[], { forceActions: true, extraSystem: (extraSystem + obsExtra + '\\n' + guardMsg + (memoryLine ? ('\\n' + memoryLine) : '')) });
+              message = String(forced.message || '').trim() || message;
+              actions = Array.isArray(forced.actions) ? forced.actions : [];
+            } catch {}
+          }
+          // Map UPDATE_MEMORY to EDIT_DIFF for specific memory files
+          try {
+            const map = { PLAN: 'PLAN.md', DECISIONS: 'DECISIONS.md', CURRENT_TASK: 'CURRENT_TASK.md', TODO: 'TODO.md', NOTES: 'NOTES.md', ARCHITECTURE: 'ARCHITECTURE.md' };
+            const mapped = [];
+            for (const a of actions) {
+              if (!a) continue;
+              const typ = String(a.type || a.action || '').toUpperCase();
+              if (typ === 'UPDATE_MEMORY' && typeof a.diff === 'string') {
+                const k = String(a.kind || '').toUpperCase();
+                const rel = map[k];
+                if (rel) {
+                  let diffText = String(a.diff || '');
+                  const hasHdr = /^(---|\+\+\+)\s/m.test(diffText);
+                  const hasHunk = /^@@/m.test(diffText);
+                  if (!hasHdr && hasHunk) {
+                    diffText = `--- a/${rel}\n+++ b/${rel}\n` + diffText.replace(/^[\r\n]+/,'');
+                  }
+                  mapped.push({ type: 'EDIT_DIFF', diff: diffText });
+                  continue;
+                }
+              }
+              mapped.push(a);
+            }
+            actions = mapped;
+          } catch {}
+          // Recompute toolActs after guard and mapping
+          const toolActs2 = actions.map(toActionRecord).filter(Boolean);
+          const planWritesActs = toolActs2;
           if (isToolPlan) {
             const lastUser = history.slice().reverse().find(m => m && m.role === 'user' && (m.content||'').trim().length > 4);
             const goal = (lastUser && lastUser.content) ? String(lastUser.content).trim() : text;
@@ -806,7 +1069,7 @@ const server = http.createServer(async (req, res) => {
             const dirPaths = [];
             const fileWrites = [];
             let combinedDiff = '';
-            for (const r of toolActs) {
+            for (const r of planWritesActs) {
               if (r.type === 'CREATE_DIR' || r.type === 'CREATE_DIRECTORY') {
                 if (r.path) dirPaths.push(r.path);
               } else if (r.type === 'CREATE_FILE_BINARY') {
@@ -867,20 +1130,23 @@ const server = http.createServer(async (req, res) => {
             pushDebug({
               ts: Date.now(), kind: 'chat_out',
               message,
-              normalized: actions.map(a => ({ type: a.type, hasPlan: !!a.plan })),
+              normalized: actions.map(a => ({ type: (a && a.type) || '', hasPlan: !!(a && a.plan) })),
               planSummary,
+              readFirstSatisfied: (performedReadTree || performedReadReadme)
             });
           } catch {}
           if (!actions.length) {
             // Do not synthesize actions; surface that no actions were returned
             return sendJSON(res, { provider: 'openai', message, actions: [] });
           }
-          return sendJSON(res, { provider: 'openai', message, actions });
+          return sendJSON(res, { provider: 'openai', message, actions: normalizeActions(actions) });
         } catch (e) {
+          try { console.error('POST /api/agent/chat failed:', e && e.stack || e); } catch {}
           // Fallback: short/ambiguous → clarify; else small mock plan
           const msgLower = text.toLowerCase();
           const ambiguousTerm = ['go','start','run','proceed'].includes(msgLower);
-          const lastUser = (history || []).slice().reverse().find(m => m && m.role === 'user' && (m.content||'').trim().length > 4);
+          const hist = Array.isArray(body.history) ? body.history : [];
+          const lastUser = hist.slice().reverse().find(m => m && m.role === 'user' && (m.content||'').trim().length > 4);
           const combined = lastUser ? String(lastUser.content).trim() : '';
           const ambiguous = (text.length < 4 && !combined) || ambiguousTerm;
           if (ambiguous) {
@@ -938,6 +1204,20 @@ const server = http.createServer(async (req, res) => {
             message = `Done — ${String(summary.goal||summary.task||'task')} • ${files.length?`Files: ${files.join(', ')}`:'No file changes'} • Tests: ${tests}`;
             if (!summary.tests || !summary.tests.ok) message += '. I can show failing output or revert to the last snapshot.';
           }
+          // Persist/update SESSION_SUMMARY.md for future handoffs
+          try {
+            const parts = [];
+            parts.push(`# Session Summary`);
+            parts.push(`Goal: ${String(summary.goal||'')}`);
+            parts.push(`Task: ${String(summary.task||'')}`);
+            const ch = Array.isArray(summary.changes) ? summary.changes.map(c=>c.path).join(', ') : '';
+            if (ch) parts.push(`Changes: ${ch}`);
+            const tests = summary.tests && summary.tests.ok ? 'pass' : 'fail';
+            parts.push(`Tests: ${tests}`);
+            if (summary.snapshotId) parts.push(`Snapshot: ${summary.snapshotId}`);
+            const txt = parts.join('\n');
+            await writeFileRecursive(safeJoin('SESSION_SUMMARY.md'), txt);
+          } catch {}
           return sendJSON(res, { message });
         } catch (e) { return sendJSON(res, { error: String(e&&e.message||e) }, 500); }
       }
@@ -1045,6 +1325,7 @@ const server = http.createServer(async (req, res) => {
         if (!ops.length) return sendJSON(res, { error: 'ops required' }, 400);
         const snapshotId = String(body.snapshotId || `${Date.now()}_${Math.random().toString(16).slice(2)}`);
         const meta = body.meta || {}; // optional metadata: { taskId, title }
+        const ENFORCE_DIFF = String(process.env.VIBE_ENFORCE_DIFF || '1').trim() === '1';
         const allowWrite = (p) => {
           const rel = String(p);
           const base = path.basename(rel);
@@ -1058,6 +1339,7 @@ const server = http.createServer(async (req, res) => {
         };
         const changes = [];
         const errors = [];
+        const warnings = [];
         try {
           for (const op of ops) {
             try {
@@ -1075,6 +1357,14 @@ const server = http.createServer(async (req, res) => {
                 const content = String(op.content ?? '');
                 if (content.length > MAX_WRITE_BYTES) throw new Error(`content too large (${content.length} > ${MAX_WRITE_BYTES})`);
                 if (content.includes('\u0000')) throw new Error('binary content not supported');
+                if (op.op === 'write' && existed) {
+                  if (ENFORCE_DIFF) {
+                    errors.push({ op, error: 'EDIT_DIFF required for existing files (VIBE_ENFORCE_DIFF=1). Use /api/patch/diff.' });
+                    continue;
+                  } else {
+                    warnings.push({ path: rel, kind: 'prefer_diff', note: 'Editing existing files should use EDIT_DIFF via /api/patch/diff' });
+                  }
+                }
                 await writeFileRecursive(full, content);
                 after = content;
               } else if (op.op === 'add_binary' || op.base64 || op.contentBase64) {
@@ -1119,7 +1409,10 @@ const server = http.createServer(async (req, res) => {
           }
           await appendEvent({ ts: Date.now(), type: 'PATCH_APPLIED', data: { snapshotId, changes: changes.map(c => ({ path: c.path, type: c.type })), commitHash, title: meta.title || '' } });
           const responseChanges = changes.map(({ path: rel, type, diff }) => ({ path: rel, absPath: path.join(ROOT, rel), type, diff }));
-          return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, changes: responseChanges, diff: diffAll, errors, commitHash, gitBranch: GIT_BRANCH });
+          if (!changes.length && errors.length) {
+            return sendJSON(res, { ok: false, errors }, 400);
+          }
+          return sendJSON(res, { ok: true, snapshotId, workspaceRoot: ROOT, changes: responseChanges, diff: diffAll, errors, warnings, commitHash, gitBranch: GIT_BRANCH });
         } finally {
           PATCH_BUSY = false;
         }
@@ -1156,13 +1449,21 @@ const server = http.createServer(async (req, res) => {
         }
 
         exec(cmd, { cwd: ROOT, timeout: timeoutMs }, async (err, stdout, stderr) => {
+          const ts = Date.now();
+          const combined = String(stdout || '') + (stderr ? (`\n[stderr]\n` + String(stderr)) : '');
+          let logRel = null;
+          try {
+            const fp = await writeLogFile(`test-${ts}.txt`, combined);
+            if (fp) logRel = path.relative(ROOT, fp).replace(/\\/g, '/');
+          } catch {}
+          function lastLines(s, n=50){ const lines=String(s||'').split(/\r?\n/); return lines.slice(-n).join('\n'); }
           if (err) {
             const code = typeof err.code === 'number' ? err.code : 1;
-            await appendEvent({ ts: Date.now(), type: 'TEST_RESULT', data: { ok: false, code, stdout: String(stdout||''), stderr: String(stderr||'') } });
-            return sendJSON(res, { ok: false, code, stdout, stderr: String(stderr || err.message || '') });
+            await appendEvent({ ts: Date.now(), type: 'TEST_RESULT', data: { ok: false, code, stdout: String(stdout||''), stderr: String(stderr||''), logPath: logRel } });
+            return sendJSON(res, { ok: false, code, stdout, stderr: String(stderr || err.message || ''), logPath: logRel, last: lastLines(combined) });
           }
-          await appendEvent({ ts: Date.now(), type: 'TEST_RESULT', data: { ok: true, code: 0, stdout, stderr } });
-          return sendJSON(res, { ok: true, code: 0, stdout, stderr });
+          await appendEvent({ ts: Date.now(), type: 'TEST_RESULT', data: { ok: true, code: 0, stdout, stderr, logPath: logRel } });
+          return sendJSON(res, { ok: true, code: 0, stdout, stderr, logPath: logRel, last: lastLines(combined) });
         });
         return; // response handled in callback
       }
@@ -1182,6 +1483,26 @@ const server = http.createServer(async (req, res) => {
       if (pathClean === '/api/config' && req.method === 'GET') {
         const cfg = await readConfig();
         return sendJSON(res, { ok: true, config: cfg });
+      }
+      if (pathClean === '/api/skills/list' && req.method === 'GET') {
+        try {
+          const dir = path.join(ROOT, 'skills');
+          const ents = await fsp.readdir(dir, { withFileTypes: true }).catch(()=>[]);
+          const out = [];
+          for (const e of ents) {
+            if (!e.isFile()) continue;
+            if (!/\.md$/i.test(e.name)) continue;
+            const fp = path.join(dir, e.name);
+            let title = e.name.replace(/\.md$/i,'');
+            try {
+              const { content } = await readTextFile(fp, 4000);
+              const first = String(content||'').split(/\r?\n/)[0].replace(/^#\s*/,'').trim();
+              if (first) title = first;
+            } catch {}
+            out.push({ name: e.name.replace(/\.md$/i,''), file: path.relative(ROOT, fp).replace(/\\/g,'/'), title });
+          }
+          return sendJSON(res, { ok: true, skills: out });
+        } catch (e) { return sendJSON(res, { ok: true, skills: [] }); }
       }
       if (pathClean === '/api/stats' && req.method === 'GET') {
         const events = await readEvents();
@@ -1222,6 +1543,13 @@ const server = http.createServer(async (req, res) => {
           const ents = await fsp.readdir(base, { withFileTypes: true });
           snapshots = ents.filter(e => e.isDirectory()).length;
         } catch {}
+        // logs count
+        let logsCount = 0;
+        try {
+          await ensureDir(LOGS_DIR);
+          const ents = await fsp.readdir(LOGS_DIR, { withFileTypes: true });
+          logsCount = ents.filter(e => e.isFile()).length;
+        } catch {}
         const lastPatchSummary = lastPatch ? {
           ts: lastPatch.ts || Date.now(),
           snapshotId: (lastPatch.data && lastPatch.data.snapshotId) || null,
@@ -1238,7 +1566,8 @@ const server = http.createServer(async (req, res) => {
           tests: { ok: testsOk, fail: testsFail },
           patches: { count: patchCount, files: patchFilesTotal, last: lastPatchSummary },
           recentFiles,
-          snapshots
+          snapshots,
+          logs: { count: logsCount }
         });
       }
       if (pathClean === '/api/snapshots/list' && req.method === 'GET') {
@@ -1332,6 +1661,23 @@ const server = http.createServer(async (req, res) => {
         maxBytes = Math.min(500_000, Math.max(1_000, maxBytes));
         const { size, content } = await readTextFile(full, maxBytes);
         return sendJSON(res, { path: userPath, size, content });
+      }
+      if (pathClean === '/api/diff/generate' && req.method === 'POST') {
+        const body = await readBody(req);
+        const rel = String(body.path || '').replace(/^\/+/, '');
+        if (!rel) return sendJSON(res, { error: 'path required' }, 400);
+        const newContent = (body.newContent !== undefined) ? String(body.newContent) : null;
+        const oldContentOverride = (body.oldContent !== undefined) ? String(body.oldContent) : null;
+        if (newContent === null) return sendJSON(res, { error: 'newContent required' }, 400);
+        const full = safeJoin(rel);
+        let existed = await exists(full);
+        let oldContent = oldContentOverride;
+        if (oldContent === null) {
+          if (existed) { try { const r = await readTextFile(full, 1_000_000); oldContent = r.content; } catch { oldContent = ''; } }
+          else { oldContent = ''; }
+        }
+        const diff = fullReplaceUnifiedDiff(rel, oldContent, newContent);
+        return sendJSON(res, { ok: true, path: rel, diff });
       }
       if (pathClean === '/api/patch/diff' && req.method === 'POST') {
         const body = await readBody(req);
@@ -1503,8 +1849,17 @@ const server = http.createServer(async (req, res) => {
           await appendEvent({ ts: Date.now(), type: 'PATCH_APPLIED', data: { snapshotId, changes: changes.map(c => ({ path: c.path, type: c.type })), commitHash, title: 'Apply diff' } });
         }
         const diffAll = changes.map(c => c.diff).join('\n');
+        // Persist combined diff to logs for auditing
+        let diffRel = null;
+        try {
+          if (!preview) {
+            const name = `diff-${snapshotId || Date.now()}.diff`;
+            const fp = await writeLogFile(name, diffAll);
+            if (fp) diffRel = path.relative(ROOT, fp).replace(/\\/g, '/');
+          }
+        } catch {}
         const responseChanges = changes.map(({ path: rel, type, diff }) => ({ path: rel, absPath: path.join(ROOT, rel), type, diff }));
-        return sendJSON(res, { ok: true, preview, snapshotId, workspaceRoot: ROOT, changes: responseChanges, diff: diffAll, warnings, commitHash, gitBranch: GIT_BRANCH });
+        return sendJSON(res, { ok: true, preview, snapshotId, workspaceRoot: ROOT, changes: responseChanges, diff: diffAll, warnings, commitHash, gitBranch: GIT_BRANCH, diffPath: diffRel });
       }
       if (pathClean === '/api/search') {
         const q = (searchParams.get('q') || '').trim();
@@ -1530,6 +1885,7 @@ const server = http.createServer(async (req, res) => {
     // Static
     return serveStatic(req, res, pathname);
   } catch (e) {
+    try { console.error('HTTP handler error:', e && e.stack || e); } catch {}
     sendJSON(res, { error: String(e && e.message || e) }, 500);
   }
 });
@@ -1537,6 +1893,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`ViBE server listening on http://localhost:${PORT}`);
   console.log(`Workspace root: ${ROOT}`);
+  try { console.log(`UI base: ${UI_DIR}`); } catch {}
 });
 
 // Optional: OpenAI client (simple) for V7 planning
@@ -1593,11 +1950,11 @@ async function openaiChat(text, context, history = [], options = {}) {
     'Your job is to understand the user request and keep a structured plan (as JSON) for changes IN THIS REPO.',
     'Policy:',
     '1) Clarify once when ambiguous. If the user answers your clarification, PRODUCE A PLAN (do not keep re-clarifying).',
-    '2) Prefer in-repo solutions. If the user says "from scratch", assume scaffolding a new app INSIDE this repo (e.g., ./todo-app) unless they explicitly request a separate project.',
+    '2) Prefer in-repo solutions. Before proposing work, LIST FILES and READ README.md if present; extract instructions from README first. Do NOT scaffold a generic app (e.g., todo app) unless the user explicitly asks. If the user explicitly says "from scratch", ask for an app name/directory and prefer ./app unless a name is provided.',
     '3) When ready to propose work, emit actions from this set as needed: EMIT_PLAN (with plan), REPLAN (with plan), PROCEED_EXECUTION, HALT_EXECUTION, ASK_INPUT (with question/options), PLAN_ONLY (no execution).',
     '4) Tasks must be relevant to THIS repo, start with status PLANNED, and be realistic next steps.',
     '5) Output must be exactly one JSON object: { "message": string, "actions": Action[] }. No additional prose.',
-    '6) Available tools: READ_TREE { dir?, depth? }, READ_FILE { path }, SEARCH { q, dir?, max?, context?, caseSensitive?, regex?, ext? }, CREATE_DIR { path }, CREATE_FILE { path, content }, CREATE_FILE_BINARY { path, base64 }, UPDATE_FILE { path, content }, EDIT_DIFF { diff }, EMIT_PLAN/REPLAN { plan }, PROCEED_EXECUTION, HALT_EXECUTION, PLAN_ONLY, ASK_INPUT.',
+    '6) Available tools: READ_TREE { dir?, depth? }, READ_FILE { path }, SEARCH { q, dir?, max?, context?, caseSensitive?, regex?, ext? }, CREATE_DIR { path }, CREATE_FILE { path, content }, CREATE_FILE_BINARY { path, base64 }, UPDATE_FILE { path, content }, EDIT_DIFF { diff }, UPDATE_MEMORY { kind, diff }, TASK { kind, ... }, EMIT_PLAN/REPLAN { plan }, PROCEED_EXECUTION, HALT_EXECUTION, PLAN_ONLY, ASK_INPUT.',
     'Tool usage examples:',
     '  - READ_TREE { dir: ".", depth: 2 }',
     '  - READ_FILE { path: "README.md" }',
@@ -1605,7 +1962,7 @@ async function openaiChat(text, context, history = [], options = {}) {
     '  - CREATE_DIR { path: "demo-app" }',
     '  - CREATE_FILE { path: "demo-app/index.html", content: "<!doctype html>..." }',
     '  - EDIT_DIFF { diff: "--- a/app.js\n+++ b/app.js\n@@ ..." }',
-    '7) Preferred write method is EDIT_DIFF with unified diffs. Use minimal context and accurate hunks. Avoid full-file rewrites unless absolutely necessary.',
+    '7) Preferred write method is EDIT_DIFF with unified diffs. Use minimal context and accurate hunks. Avoid full-file rewrites unless absolutely necessary. For memory files use UPDATE_MEMORY.',
     '8) When creating files, use CREATE_FILE with fields { path, content } and include the full file contents needed (HTML/CSS/JS).',
     '9) When modifying existing files without diffs, you may use UPDATE_FILE with { path, content } including the entire revised file content (avoid if large).',
     '10) When creating directories, use CREATE_DIR with { path }.',

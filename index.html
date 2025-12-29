@@ -16,7 +16,10 @@
       <div id="permBanner" class="tiny-tag" style="margin-left:8px; background:#d97706; color:#0b0b0b; display:none;" title="Permissions required"></div>
       <div class="controls">
         <div class="mode-toggle" aria-label="Mode"></div>
+        <button id="btnTerminal" class="reset-btn" title="Toggle terminal chat styling">Terminal: Off</button>
         <button id="btnAutopilot" class="auto-btn" title="Autopilot toggles agent pacing">Autopilot: On</button>
+        <button id="btnSkills" class="reset-btn" title="Select skills to load">Skills</button>
+        <button id="btnNewSession" class="reset-btn" title="Start a new session from state">New Session</button>
         <button id="btnDevTools" class="reset-btn" title="Open developer tools">Dev Tools</button>
         <button id="btnPerms" class="reset-btn" title="Manage permissions">Permissions</button>
         <button id="btnHelp" class="reset-btn" title="Open help and endpoints">Help</button>
@@ -32,9 +35,13 @@
         <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
         <form id="chatForm" class="chat-input" autocomplete="off">
           <input id="chatText" type="text" placeholder="Describe what you want to build…" aria-label="Chat input" />
+          <button id="btnQuote" type="button" title="Quote selection">Quote</button>
           <button type="submit" title="Send">Send</button>
         </form>
       </section>
+
+      <!-- Resizer between Chat and Kanban -->
+      <div class="gutter gutter-left" role="separator" aria-orientation="vertical" aria-label="Resize chat and kanban"></div>
 
       <!-- Kanban Pane -->
       <section class="pane kanban-pane">
@@ -63,6 +70,9 @@
         </div>
       </section>
 
+      <!-- Resizer between Kanban and Evidence -->
+      <div class="gutter gutter-right" role="separator" aria-orientation="vertical" aria-label="Resize kanban and evidence"></div>
+
       <!-- Evidence Pane -->
       <section class="pane evidence-pane">
         <div class="pane-header">Evidence <button id="btnPreviewDiff" class="preview-btn" title="Open diff preview">Preview Diff</button> <button id="btnRevertCard" class="revert-btn hide" title="Revert this card" disabled>Revert Card</button> <button id="btnReapplyCard" class="revert-btn hide" style="background:#35c759;color:#00140a;" title="Reapply this card" disabled>Reapply Card</button></div>
@@ -83,7 +93,13 @@
             </div>
             <pre id="planBody" class="code" style="white-space:pre-wrap; background:transparent; border:none; padding:0; margin:0;"></pre>
           </div>
-          <pre id="tab-memory" class="tab-panel code" aria-label="Memory"></pre>
+          <div id="tab-memory-wrap" class="tab-panel code" aria-label="Memory" style="padding:8px;">
+            <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button id="btnEditDecisions" class="modal-btn" title="Edit DECISIONS.md">Edit Decisions</button>
+              <button id="btnEditCurrent" class="modal-btn" title="Edit CURRENT_TASK.md">Edit Current Task</button>
+            </div>
+            <pre id="tab-memory" class="code" style="margin:0;"></pre>
+          </div>
         </div>
       </section>
     </main>
@@ -172,6 +188,23 @@
           </div>
         </div>
         <pre id="helpBody" class="code" tabindex="0" aria-label="Help" style="max-height:70vh; overflow:auto;"></pre>
+      </div>
+    </div>
+
+    <!-- Skills Modal -->
+    <div id="skillsModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Skills">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Skills</div>
+          <div class="modal-actions">
+            <button id="skillsClose" class="modal-btn" title="Close">Close</button>
+            <button id="skillsSave" class="modal-btn" title="Save">Save</button>
+          </div>
+        </div>
+        <div class="code" style="padding:12px; max-height:60vh; overflow:auto;">
+          <div id="skillsList" style="display:flex; flex-direction:column; gap:6px;"></div>
+        </div>
       </div>
     </div>
 

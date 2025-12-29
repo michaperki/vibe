@@ -58,7 +58,8 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 340px 1fr 420px;
+  /* Resizable columns via CSS variables */
+  grid-template-columns: var(--chat, 340px) 6px 1fr 6px var(--evid, 420px);
   grid-template-rows: 1fr;
   gap: 10px;
   padding: 10px;
@@ -106,6 +107,21 @@ body {
 .mini-copy { margin-left: 6px; padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); background: var(--elev); color: var(--text); border-radius: 6px; cursor: pointer; }
 .mini-copy:hover { filter: brightness(1.05); }
 .msg .who { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+
+/* Markdown within chat bubbles */
+.msg .bubble h1, .msg .bubble h2, .msg .bubble h3 { margin: 6px 0; }
+.msg .bubble h1 { font-size: 1.2rem; }
+.msg .bubble h2 { font-size: 1.1rem; }
+.msg .bubble h3 { font-size: 1rem; }
+.msg .bubble p { margin: 6px 0; }
+.msg .bubble ul, .msg .bubble ol { margin: 6px 0 6px 18px; padding: 0; }
+.msg .bubble li { margin: 3px 0; }
+.msg .bubble a { color: var(--accent); text-decoration: none; }
+.msg .bubble a:hover { text-decoration: underline; }
+.msg .bubble code { background: #0c141c; border: 1px solid var(--border); padding: 1px 4px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.msg .bubble pre { background: #0c141c; border: 1px solid var(--border); padding: 10px; border-radius: 8px; overflow: auto; }
+.msg .bubble pre code { border: none; padding: 0; background: transparent; }
+.msg .bubble blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid #2a3a4a; color: #a9b4bf; }
 
 .chat-input {
   display: flex;
@@ -197,8 +213,20 @@ body {
 .code .meta { color: #8ab4f8; }
 
 /* Responsive */
+/* Resizable gutters */
+.gutter { background: #243241; border: 1px solid #1e2a36; border-radius: 4px; cursor: col-resize; }
+.gutter:hover { background: #2d3f52; }
+
+/* Terminal mode: monospace and minimal chrome */
+.terminal-mode .msg .bubble { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; background: #0c141c; border-color: #1e2a36; }
+.terminal-mode .msg.user .bubble { background: #0c141c; }
+.terminal-mode .msg.agent .bubble { background: #0c141c; }
+.terminal-mode .chat-input input { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
 @media (max-width: 1200px) {
+  /* Collapse to single column on narrow screens; hide gutters */
   .layout { grid-template-columns: 1fr; grid-template-rows: 380px 380px 380px; }
+  .gutter { display: none; }
 }
 
 /* Modal */

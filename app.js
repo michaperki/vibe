@@ -21,9 +21,12 @@ const btnModeV5 = qs('#btnModeV5');
 const btnModeV6 = qs('#btnModeV6');
 const btnModeV7 = qs('#btnModeV7');
 const btnAutopilot = qs('#btnAutopilot');
+const btnTerminal = qs('#btnTerminal');
 const workspaceInfoEl = qs('#workspaceInfo');
 const btnChangeWorkspace = qs('#btnChangeWorkspace');
 const btnHelp = qs('#btnHelp');
+const btnSkills = qs('#btnSkills');
+const btnNewSession = qs('#btnNewSession');
 const permBanner = qs('#permBanner');
 const wsModal = qs('#wsModal');
 const wsClose = qs('#wsClose');
@@ -33,6 +36,10 @@ const wsCurrent = qs('#wsCurrent');
 const helpModal = qs('#helpModal');
 const helpClose = qs('#helpClose');
 const helpBody = qs('#helpBody');
+const skillsModal = qs('#skillsModal');
+const skillsClose = qs('#skillsClose');
+const skillsSave = qs('#skillsSave');
+const skillsList = qs('#skillsList');
 const btnPerms = qs('#btnPerms');
 const permModal = qs('#permModal');
 const permClose = qs('#permClose');
@@ -59,6 +66,8 @@ const devSnapPrune = qs('#devSnapPrune');
 const devSnapList = qs('#devSnapList');
 const devStats = qs('#devStats');
 let devTailTimer = null;
+let selectedSkills = [];
+let handoffNext = false;
 
 const colPlanned = qs('#col-planned');
 const colExecuting = qs('#col-executing');
@@ -75,7 +84,12 @@ const planBody = qs('#planBody');
 const btnPlanToggle = qs('#btnPlanToggle');
 let showPlanRaw = false;
 const tabMemory = qs('#tab-memory');
+const btnEditDecisions = qs('#btnEditDecisions');
+const btnEditCurrent = qs('#btnEditCurrent');
 const btnPreviewDiff = qs('#btnPreviewDiff');
+const btnQuote = qs('#btnQuote');
+const gutterLeft = qs('.gutter-left');
+const gutterRight = qs('.gutter-right');
 const diffModal = qs('#diffModal');
 const modalBody = qs('#modalBody');
 const modalClose = qs('#modalClose');
@@ -95,12 +109,26 @@ let keepRegionsStrict = true;
 let noPendingNoticeShown = false;
 let execInChat = false;
 let perms = { read: false, write: false, test: false };
+let terminalMode = false;
+let chatWidth = 340;
+let evidWidth = 420;
 
 try {
   const pref = localStorage.getItem('vibe.keepStrict');
   if (pref === '0') keepRegionsStrict = false;
   const eic = localStorage.getItem('vibe.execInChat');
   execInChat = eic === '1';
+  const tmode = localStorage.getItem('vibe.terminal');
+  terminalMode = tmode === '1';
+  const cw = parseInt(localStorage.getItem('vibe.chatWidth') || '0', 10);
+  const ew = parseInt(localStorage.getItem('vibe.evidWidth') || '0', 10);
+  if (cw > 200) chatWidth = cw;
+  if (ew > 200) evidWidth = ew;
+} catch {}
+// Skills init
+try {
+  const raw = localStorage.getItem('vibe.skills');
+  if (raw) selectedSkills = JSON.parse(raw);
 } catch {}
 // Permissions init
 try {
@@ -156,6 +184,15 @@ function stopStatus() {
   statusTimer = null;
   if (kanbanStatusEl) kanbanStatusEl.classList.remove('loading');
 }
+// Apply initial UI state (terminal + widths)
+try {
+  if (terminalMode) {
+    document.body.classList.add('terminal-mode');
+    if (btnTerminal) btnTerminal.textContent = 'Terminal: On';
+  }
+  document.documentElement.style.setProperty('--chat', chatWidth + 'px');
+  document.documentElement.style.setProperty('--evid', evidWidth + 'px');
+} catch {}
 function refreshIdleStatus() {
   try {
     const total = (plan?.tasks || []).length;
@@ -217,6 +254,78 @@ function normalizePlanInPlace(p) {
   return p;
 }
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function safeUrl(href) {
+  try {
+    const trimmed = (href || '').trim();
+    if (/^(https?:|mailto:|#)/i.test(trimmed)) return trimmed;
+  } catch {}
+  return '';
+}
+
+function renderMarkdownSafe(input) {
+  if (!input) return '';
+  let text = String(input);
+  // Extract fenced code blocks first
+  const blocks = [];
+  text = text.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/g, (m, lang, code) => {
+    const idx = blocks.length;
+    blocks.push(`<pre><code class="lang-${(lang||'').toLowerCase()}">${escapeHtml(code)}</code></pre>`);
+    return `@@BLOCK_${idx}@@`;
+  });
+  // Escape remaining HTML
+  text = escapeHtml(text);
+  // Inline code
+  text = text.replace(/`([^`]+)`/g, (m, code) => `<code>${escapeHtml(code)}</code>`);
+  // Headings
+  text = text.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>')
+             .replace(/^##\s+(.+)$/gm, '<h2>$1</h2>')
+             .replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+  // Blockquotes
+  text = text.replace(/^>\s?(.+)$/gm, '<blockquote>$1</blockquote>');
+  // Links [text](url)
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, label, href) => {
+    const u = safeUrl(href);
+    if (!u) return label;
+    return `<a href="${u}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  });
+  // Bold / italics (basic)
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+             .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  // Lists (very small parser)
+  const lines = text.split(/\n/);
+  const out = [];
+  let inUl = false, inOl = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (!inUl) { if (inOl) { out.push('</ol>'); inOl = false; } out.push('<ul>'); inUl = true; }
+      out.push(`<li>${line.replace(/^\s*[-*]\s+/, '')}</li>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      if (!inOl) { if (inUl) { out.push('</ul>'); inUl = false; } out.push('<ol>'); inOl = true; }
+      out.push(`<li>${line.replace(/^\s*\d+\.\s+/, '')}</li>`);
+      continue;
+    }
+    if (inUl) { out.push('</ul>'); inUl = false; }
+    if (inOl) { out.push('</ol>'); inOl = false; }
+    if (line.trim().length === 0) { out.push(''); continue; }
+    out.push(`<p>${line}</p>`);
+  }
+  if (inUl) out.push('</ul>');
+  if (inOl) out.push('</ol>');
+  let html = out.join('\n');
+  html = html.replace(/@@BLOCK_(\d+)@@/g, (m, i) => blocks[Number(i)] || '');
+  return html;
+}
+
 function addMessage({ who, text }) {
   const wrap = document.createElement('div');
   wrap.className = `msg ${who}`;
@@ -225,7 +334,7 @@ function addMessage({ who, text }) {
   whoEl.textContent = who === 'user' ? 'You' : (who === 'system' ? 'Execution' : 'Agent');
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = text;
+  try { bubble.innerHTML = renderMarkdownSafe(text); } catch { bubble.textContent = String(text || ''); }
   wrap.appendChild(whoEl);
   wrap.appendChild(bubble);
   chatMessagesEl.appendChild(wrap);
@@ -551,6 +660,67 @@ function buildPlanSummary(p) {
   } catch { return 'Plan Summary'; }
 }
 btnPlanToggle?.addEventListener('click', () => { showPlanRaw = !showPlanRaw; renderPlanJson(); });
+
+// Terminal mode toggle
+btnTerminal?.addEventListener('click', () => {
+  terminalMode = !terminalMode;
+  document.body.classList.toggle('terminal-mode', terminalMode);
+  try { localStorage.setItem('vibe.terminal', terminalMode ? '1' : '0'); } catch {}
+  if (btnTerminal) btnTerminal.textContent = `Terminal: ${terminalMode ? 'On' : 'Off'}`;
+});
+
+// Quote selection into chat input
+btnQuote?.addEventListener('click', () => {
+  try {
+    const sel = window.getSelection();
+    const s = (sel && sel.toString()) ? sel.toString().trim() : '';
+    if (!s) return;
+    const quoted = s.split(/\n/).map(l => `> ${l}`).join('\n');
+    const curr = chatText.value;
+    chatText.value = (quoted + (curr ? '\n\n' + curr : ''));
+    chatText.focus();
+  } catch {}
+});
+
+// Resizable gutters
+function getVarPx(name, fallback) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name);
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  } catch { return fallback; }
+}
+function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+
+function startDrag(e, kind) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startChat = getVarPx('--chat', chatWidth);
+  const startEvid = getVarPx('--evid', evidWidth);
+  function onMove(ev) {
+    const dx = ev.clientX - startX;
+    if (kind === 'left') {
+      const next = clamp(startChat + dx, 220, 800);
+      chatWidth = next;
+      document.documentElement.style.setProperty('--chat', next + 'px');
+      try { localStorage.setItem('vibe.chatWidth', String(next)); } catch {}
+    } else if (kind === 'right') {
+      const next = clamp(startEvid - dx, 260, 900);
+      evidWidth = next;
+      document.documentElement.style.setProperty('--evid', next + 'px');
+      try { localStorage.setItem('vibe.evidWidth', String(next)); } catch {}
+    }
+  }
+  function onUp() {
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+  }
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+}
+
+gutterLeft?.addEventListener('mousedown', (e) => startDrag(e, 'left'));
+gutterRight?.addEventListener('mousedown', (e) => startDrag(e, 'right'));
 
 // Fake tools
 const fakeTools = {
@@ -985,7 +1155,7 @@ chatForm.addEventListener('submit', (e) => {
   const text = chatText.value.trim();
   if (!text) return;
   chatText.value = '';
-  // Slash commands become model hints (no direct tool execution)
+  // Slash commands become model hints (no direct tool execution) and quick utilities
   if (text.startsWith('/')) {
     const [cmd, ...rest] = text.split(/\s+/);
     const arg = rest.join(' ').trim();
@@ -996,6 +1166,22 @@ chatForm.addEventListener('submit', (e) => {
     if (cmd === '/tree') hint = `List files via READ_TREE { dir: "${arg||'.'}", depth: 2 }`;
     if (cmd === '/file') hint = `Open file via READ_FILE { path: "${arg||'README.md'}" }`;
     if (cmd === '/search') hint = `Search via SEARCH { q: "${arg||'TODO'}", dir: ".", context: 1 }`;
+    if (cmd === '/skills') {
+      (async () => {
+        try { const res = await fetch('/api/skills/list'); const data = await res.json(); const have=(selectedSkills||[]).join(', ')||'(none)'; const avail=(Array.isArray(data.skills)?data.skills.map(s=>s.name).join(', '):'(none)'); addMessage({ who:'agent', text:`Skills — selected: ${have}\nAvailable: ${avail}` }); }
+        catch { addMessage({ who:'agent', text:'No skills found.' }); }
+      })();
+      return;
+    }
+    if (cmd === '/skill') {
+      if (!arg) { addMessage({ who:'agent', text: 'Usage: /skill <name>' }); return; }
+      const name = arg.trim();
+      const on = selectedSkills.includes(name);
+      if (on) selectedSkills = selectedSkills.filter(x => x !== name); else selectedSkills.push(name);
+      try { localStorage.setItem('vibe.skills', JSON.stringify(selectedSkills)); } catch {}
+      addMessage({ who:'system', text: `${on ? 'Removed' : 'Added'} skill: ${name}` });
+      return;
+    }
     addMessage({ who: 'user', text });
     v7Chat(hint || text);
     return;
@@ -1258,6 +1444,63 @@ devSnapPrune?.addEventListener('click', async () => {
   }
 });
 
+// Skills modal controls
+async function openSkillsModal() {
+  try {
+    const res = await fetch('/api/skills/list');
+    const data = await res.json();
+    const list = Array.isArray(data.skills) ? data.skills : [];
+    skillsList.innerHTML = '';
+    for (const s of list) {
+      const row = document.createElement('label');
+      row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '8px';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = selectedSkills.includes(s.name);
+      cb.addEventListener('change', () => {
+        if (cb.checked) { if (!selectedSkills.includes(s.name)) selectedSkills.push(s.name); }
+        else { selectedSkills = selectedSkills.filter(x => x !== s.name); }
+      });
+      const name = document.createElement('span'); name.textContent = s.title || s.name;
+      const file = document.createElement('code'); file.textContent = s.file || '';
+      row.appendChild(cb); row.appendChild(name); row.appendChild(file);
+      skillsList.appendChild(row);
+    }
+  } catch {
+    skillsList.textContent = 'No skills found.';
+  }
+  skillsModal.classList.remove('hidden');
+  skillsModal.setAttribute('aria-hidden', 'false');
+}
+function closeSkillsModal(){ skillsModal.classList.add('hidden'); skillsModal.setAttribute('aria-hidden','true'); }
+btnSkills?.addEventListener('click', openSkillsModal);
+skillsClose?.addEventListener('click', closeSkillsModal);
+skillsModal?.addEventListener('click', (e) => { if (e.target && e.target.getAttribute('data-close')) closeSkillsModal(); });
+skillsSave?.addEventListener('click', () => { try { localStorage.setItem('vibe.skills', JSON.stringify(selectedSkills)); } catch {} closeSkillsModal(); addMessage({ who:'system', text:`Skills saved: ${(selectedSkills||[]).join(', ')||'(none)'}` }); });
+
+// New Session button
+btnNewSession?.addEventListener('click', async () => {
+  try {
+    chatHistory = [];
+    chatMessagesEl.innerHTML = '';
+    addMessage({ who:'system', text: 'Starting a new session from state…' });
+    handoffNext = true;
+    await v7Chat('New session');
+  } catch {}
+});
+
+// Memory editing via prompt and diff
+async function editMemoryFile(rel, title) {
+  try {
+    let current = '';
+    try { const r = await apiJson(`/api/file?path=${encodeURIComponent(rel)}&maxBytes=200000`); current = String(r.content || ''); } catch {}
+    const next = prompt(`${title}`, current);
+    if (next == null || next === current) return;
+    const gen = await apiPost('/api/diff/generate', { path: rel, newContent: String(next) });
+    if (gen && gen.diff) { await postPatchDiff({ diff: gen.diff, keepRegions: !!keepRegionsStrict }); await v6FetchAndRender(); addMessage({ who:'system', text:`Updated ${rel}` }); }
+  } catch (e) { addMessage({ who:'system', text:`Edit failed for ${rel}: ${String(e)}` }); }
+}
+btnEditDecisions?.addEventListener('click', () => editMemoryFile('DECISIONS.md', 'Edit DECISIONS.md'));
+btnEditCurrent?.addEventListener('click', () => editMemoryFile('CURRENT_TASK.md', 'Edit CURRENT_TASK.md'));
+
 function startDevTail() {
   stopDevTail();
   devTailTimer = setInterval(fetchDebugLogs, 1500);
@@ -1291,7 +1534,8 @@ async function v7Chat(text) {
   try {
     startStatus(deriveThinkingLabel());
     const clientState = buildClientState();
-    const out = await apiPost('/api/agent/chat', { text, history: chatHistory.slice(-10), client: clientState });
+    const out = await apiPost('/api/agent/chat', { text, history: chatHistory.slice(-10), client: clientState, handoff: !!handoffNext });
+    handoffNext = false;
     const message = out.message || '...';
     const actions = Array.isArray(out.actions) ? out.actions : [];
     const types = new Set(actions.map(a => a && a.type).filter(Boolean));
@@ -1523,9 +1767,16 @@ function addExecutionSummary(patchRes, runRes, task) {
     // Tests output (first 8 lines)
     const testsHdr = document.createElement('div'); testsHdr.textContent = 'Tests:';
     const pre = document.createElement('pre'); pre.className = 'code'; pre.style.whiteSpace='pre-wrap';
-    pre.textContent = String(runRes?.stdout || '').split(/\r?\n/).slice(0,8).join('\n');
-
-    body.appendChild(filesLine);
+    const tail = String((runRes && (runRes.last || runRes.stdout)) || '').split(/\r?\n/).slice(0,8).join('\n');
+    pre.textContent = tail;
+    if (runRes && runRes.logPath) {
+      const logLine = document.createElement('div');
+      logLine.textContent = 'Log: ';
+      const code = document.createElement('code'); code.textContent = runRes.logPath;
+      logLine.appendChild(code);
+      body.appendChild(logLine);
+    }
+body.appendChild(filesLine);
     body.appendChild(snapLine);
     body.appendChild(testsHdr);
     body.appendChild(pre);
@@ -1543,7 +1794,12 @@ function addExecutionSummary(patchRes, runRes, task) {
 function buildClientState() {
   const pendingCount = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE).length;
   const activeDir = guessActiveDirFromPlan(plan) || null;
-  return { pendingCount, activeDir, autopilot: v5Autopilot, perms: { read: !!perms.read, write: !!perms.write, test: !!perms.test } };
+  let overlay = null;
+  try {
+    const t = (plan?.tasks || []).find(x => x.taskId === selectedTaskId) || (plan?.tasks || []).find(x => x.status === STATUS.EXECUTING) || null;
+    if (t) overlay = taskOverlayPath(t);
+  } catch {}
+  return { pendingCount, activeDir, overlay, skills: selectedSkills, autopilot: v5Autopilot, perms: { read: !!perms.read, write: !!perms.write, test: !!perms.test } };
 }
 
 function guessActiveDirFromPlan(p) {
@@ -1645,86 +1901,77 @@ async function v7Start(goal) {
 }
 
 async function latestApplyPatchForTask(task) {
-  const ops = [];
   const rawTitle = String(task.title || task.description || '');
-  const title = rawTitle.toLowerCase();
-
   function norm(p){ return p.replace(/\\/g,'/').replace(/^\.\//,''); }
   function parseQuoted(s){ const m=s.match(/["']([^"']+)["']/); return m?m[1]:null; }
-
-  // Extract paths from steps (e.g., "write hello-vibes/index.html")
-  const stepPaths = [];
-  if (Array.isArray(task.steps)) {
-    for (const st of task.steps) {
-      const m1 = String(st).match(/\bwrite\s+['"]?([^'"\n]+)['"]?/i);
-      if (m1) stepPaths.push(norm(m1[1]));
-      const m2 = String(st).match(/\bmkdir\s+['"]?([^'"\n]+)['"]?/i);
-      if (m2) stepPaths.push(norm(m2[1]) + '/.gitkeep');
-    }
-  }
 
   // If the plan includes a unified diff, apply it via diff endpoint
   if (typeof task.diff === 'string' && task.diff.trim()) {
     return postPatchDiff({ diff: String(task.diff), keepRegions: !!keepRegionsStrict });
   }
 
-  // If the plan includes explicit writes (path + content), honor them verbatim
-  const seen = new Set();
+  // Collect target files from steps/title to scaffold via diffs when applicable
+  const scaffoldTargets = new Set();
+  if (Array.isArray(task.steps)) {
+    for (const st of task.steps) {
+      const m1 = String(st).match(/\bwrite\s+['"]?([^'"\n]+)['"]?/i);
+      if (m1) scaffoldTargets.add(norm(m1[1]));
+    }
+  }
+  const q = parseQuoted(rawTitle);
+  if (/create\s+.*?file/i.test(rawTitle)) {
+    const f = norm(q || rawTitle.split(/file/i).pop().trim());
+    if (f) scaffoldTargets.add(f);
+  }
+
+  const diffs = [];
+  const changedPaths = new Set();
+
+  // If explicit writes are present, convert all to unified diffs (server-side generate)
   if (Array.isArray(task.writes)) {
     for (const w of task.writes) {
       if (!w || !w.path) continue;
       const p = norm(String(w.path));
       if (w.base64) {
-        ops.push({ op: 'add_binary', path: p, base64: String(w.base64) });
-      } else {
-        const content = (w.content !== undefined) ? String(w.content) : '';
-        ops.push({ op: 'add', path: p, content });
+        // binary not supported via diff; fall back to add_binary through /api/patch
+        // minimal support: skip here; let next block scaffold if possible
+        continue;
       }
-      seen.add(p);
+      const content = (w.content !== undefined) ? String(w.content) : '';
+      try {
+        const gen = await apiPost('/api/diff/generate', { path: p, newContent: content });
+        if (gen && gen.diff && gen.diff.trim()) { diffs.push(String(gen.diff)); changedPaths.add(p); }
+      } catch {}
     }
   }
 
-  // Extract path from title
-  let fileFromTitle = null;
-  let dirFromTitle = null;
-  const q = parseQuoted(rawTitle);
-  if (/create\s+.*?(directory|folder)/i.test(rawTitle)) {
-    dirFromTitle = norm(q || rawTitle.split(/directory|folder/i).pop().trim());
-  } else if (/create\s+.*?file/i.test(rawTitle)) {
-    fileFromTitle = norm(q || rawTitle.split(/file/i).pop().trim());
+  // Add scaffolds (diffs) for any paths implied by steps/title that weren't covered by writes
+  for (const p of scaffoldTargets) {
+    try {
+      if (changedPaths.has(p)) continue; // a write already covers this path — do not scaffold over it
+      // Skip scaffolding if file already exists to avoid overwriting existing app content
+      try {
+        const r = await fetch(`/api/file?path=${encodeURIComponent(p)}&head=1`);
+        if (r && r.ok) continue;
+      } catch {}
+      const gen = await apiPost('/api/diff/generate', { path: p, newContent: scaffoldFor(p) });
+      if (gen && gen.diff && gen.diff.trim()) { diffs.push(String(gen.diff)); changedPaths.add(p); }
+    } catch {}
   }
 
-  // Directory creation: add .gitkeep
-  if (dirFromTitle) {
-    const dir = dirFromTitle.replace(/\/$/, '');
-    ops.push({ op: 'add', path: `${dir}/.gitkeep`, content: '' });
+  // Fallback: if nothing to change, append a README note via diff
+  if (diffs.length === 0) {
+    try {
+      let cur = '';
+      try { const rf = await apiJson('/api/file?path=README.md'); cur = String(rf.content || ''); } catch {}
+      const note = `\n\nLatest task: ${(task.title||task.description||'Task')} — ${new Date().toISOString()}`;
+      const gen = await apiPost('/api/diff/generate', { path: 'README.md', newContent: cur + note });
+      if (gen && gen.diff && gen.diff.trim()) diffs.push(String(gen.diff));
+    } catch {}
   }
 
-  // File creation from title
-  if (fileFromTitle) {
-    const path = fileFromTitle;
-    if (!seen.has(path)) {
-      ops.push({ op: 'add', path, content: scaffoldFor(path) });
-      seen.add(path);
-    }
-  }
-
-  // File creations from steps
-  for (const p of stepPaths) {
-    if (!seen.has(p)) {
-      ops.push({ op: 'add', path: p, content: scaffoldFor(p) });
-      seen.add(p);
-    }
-  }
-
-  // Default: note in README if nothing matched
-  if (ops.length === 0) {
-    let content = '';
-    try { const file = await apiJson('/api/file?path=README.md'); content = String(file.content); } catch {}
-    const note = `\n\nLatest task: ${(task.title||task.description||'Task')} — ${new Date().toISOString()}`;
-    ops.push({ op: content ? 'write' : 'add', path: 'README.md', content: content + note });
-  }
-  return postPatch({ ops, meta: { taskId: task.taskId || task.id, title: rawTitle } });
+  const combined = diffs.join('\n');
+  return postPatchDiff({ diff: combined, keepRegions: !!keepRegionsStrict });
 
   function scaffoldFor(p){
     const pn = String(p).toLowerCase();
@@ -1771,6 +2018,57 @@ async function postPatchDiff(body, tries = 6, delayMs = 250) {
   return await apiPost('/api/patch/diff', body);
 }
 
+function taskSlugFromTitle(title, id) {
+  const base = String(title || 'task').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48) || 'task';
+  const short = String(id || '').replace(/^id-/, '').slice(-6) || Math.random().toString(16).slice(2,8);
+  return `${base}-${short}`;
+}
+function taskOverlayPath(task) {
+  const slug = taskSlugFromTitle(task.title || task.description || 'task', task.taskId || task.id);
+  return `tasks/${slug}.md`;
+}
+
+async function ensureTaskOverlay(task) {
+  const rel = taskOverlayPath(task);
+  // Check existence
+  let exists = false;
+  try {
+    const r = await fetch(`/api/file?path=${encodeURIComponent(rel)}&head=1`);
+    exists = r.ok;
+  } catch {}
+  if (exists) return;
+  // Build overlay content
+  const filesFromTask = [];
+  try {
+    if (Array.isArray(task.writes)) { for (const w of task.writes) if (w?.path) filesFromTask.push(String(w.path)); }
+    if (typeof task.diff === 'string') {
+      const lines = String(task.diff).split(/\r?\n/);
+      for (const ln of lines) { if (ln.startsWith('+++ ')) { const m = ln.match(/^\+\+\+\s+(?:b\/)?(.+)$/); if (m && m[1]) filesFromTask.push(m[1]); } }
+    }
+  } catch {}
+  const uniqFiles = Array.from(new Set(filesFromTask)).slice(0, 10);
+  const content = [
+    `# Task Overlay — ${task.title || task.description || 'Task'}`,
+    `TaskId: ${task.taskId || task.id}`,
+    '',
+    `Goal: ${plan?.goal || ''}`,
+    '',
+    'Acceptance Criteria:',
+    ...(Array.isArray(task.steps) && task.steps.length ? task.steps.map(s => `- ${s}`) : ['- Criteria defined during execution']),
+    '',
+    'Target Files:',
+    ...(uniqFiles.length ? uniqFiles.map(p=>`- ${p}`) : ['- (TBD)']),
+    '',
+    'Verify:',
+    '- npm test',
+  ].join('\n');
+  try {
+    const gen = await apiPost('/api/diff/generate', { path: rel, newContent: content });
+    if (gen && gen.diff) await postPatchDiff({ diff: gen.diff, keepRegions: !!keepRegionsStrict });
+    try { await v6Log('TASK_OVERLAY_CREATED', { path: rel, taskId: task.taskId || task.id }); } catch {}
+  } catch {}
+}
+
 async function latestRunQueue() {
   if (!v5Autopilot) return;
   clearTimers();
@@ -1790,6 +2088,7 @@ async function latestRunQueue() {
   }
   noPendingNoticeShown = false;
   const t = queue[0];
+  try { await ensureTaskOverlay(t); } catch {}
   v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.EXECUTING, notes: 'Applying patch' });
   startStatus('Applying patch…');
   if (!perms.write) {
@@ -1824,7 +2123,7 @@ async function latestRunQueue() {
   try {
     startStatus('Running tests…');
     if (!perms.test) { throw new Error('Tests require permission'); }
-    const runRes = await apiPost('/api/run', { kind: 'test', timeoutMs: 15000 });
+    const runRes = await apiPost('/api/run', { kind: 'test', timeoutMs: 15000, confirm: true });
     const ok = !!runRes.ok;
     v3Evidence[t.taskId] = { diff: v3Evidence[t.taskId]?.diff || '', logs: `tests: ${ok ? 'ok' : 'fail'}\n${(runRes.stdout || '').slice(0, 2000)}`, tests: (runRes.stdout || '').slice(0, 4000), files: v3Evidence[t.taskId]?.files || [] };
     if (ok) {
@@ -2580,7 +2879,9 @@ try {
       '- GET /api/file?path=...&start=0&end=5000 — byte range',
       '- GET /api/search?q=term&context=2 — search with ±N lines',
       '- GET /api/search?q=^POST%20/api/patch&regex=1&case=sensitive — regex',
-      '- POST /api/patch/diff { diff, keepRegions } — apply unified diff',
+      '- POST /api/patch/diff { diff, keepRegions } — apply unified diff (returns diffPath)',
+      '- POST /api/diff/generate { path, newContent } — build a minimal diff',
+      '- POST /api/run { kind:"test" } — run tests (returns logPath, last)',
       '- POST /api/revert { snapshotId, direction } — revert or reapply',
       '- GET /api/stats — tool call counters'
     ].join('\n');
