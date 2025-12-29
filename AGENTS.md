@@ -39,20 +39,25 @@ Configuration
 Server Endpoints (selected)
 - `GET /api/ping` → `{ ok, workspaceRoot }`
 - `GET /api/tree?path=.&depth=2` → shallow file tree
-- `GET /api/file?path=...` → read a file (bounded)
-- `GET /api/search?q=...` → search text
+- `GET /api/file?path=...` → read a file (bounded). Optional byte-range params: `head`, `tail`, or `start`/`end`; optional `maxBytes` cap.
+- `GET /api/search?q=...` → search text. Optional `regex=1`, `case=sensitive`, and `context=N` (±N lines).
 - `POST /api/patch` → atomic text writes with snapshots; returns combined diff
+- `POST /api/patch/diff { diff, keepRegions?, preview? }` → apply unified diff with keep‑regions and snapshots; returns per‑file diffs and warnings. Prefer this for edits.
 - `POST /api/revert` → restore a snapshot (per-card revert)
+- `POST /api/revert/check` → get divergence warnings before revert/reapply
 - `POST /api/run { kind: "test", confirm?: true }` → runs `npm test` if present (optionally gated)
 - `POST /api/agent/plan { goal }` → plan JSON via OpenAI (fallback deterministic if missing)
 - `POST /api/agent/chat { text, history?, client? }` → action-oriented chat (READ/CREATE/UPDATE/PLAN/PROCEED etc.)
+- `POST /api/wrapup { summary }` → returns concise run wrap‑up (OpenAI if configured)
 
 Action Schema (expectations)
 - READ_FILE `{ path }`
-- CREATE_FILE `{ path, content }` (full file content)
-- UPDATE_FILE `{ path, content }` (full file content)
+- EDIT_DIFF `{ diff, keepRegions? }` (preferred for edits; unified diff)
+- CREATE_FILE `{ path, content }` (full file content for new files)
+- UPDATE_FILE `{ path, content }` (use sparingly; prefer EDIT_DIFF when possible)
 - EMIT_PLAN `{ plan }`, REPLAN `{ plan }`
 - PROCEED_EXECUTION | HALT_EXECUTION | PLAN_ONLY | ASK_INPUT
+– Optional: META `{ risk, assumptions }` attached to card evidence
 
 Guardrails & Limits
 - Path safety: normalized joins under the workspace root; `.git/` and `node_modules/` are blocked for writes.
@@ -77,17 +82,31 @@ Repo Layout (after cleanup)
 Do’s and Don’ts for Agents
 - Do:
   - Inspect current files via `/api/tree`/`/api/file` before proposing changes.
-  - Use full-file `CREATE_FILE`/`UPDATE_FILE` actions; avoid diffs/snippets.
+  - Prefer `EDIT_DIFF` with unified diffs via `/api/patch/diff` for modifications; use `CREATE_FILE` for new files.
+  - Use `/api/file` range params (`head`, `tail`, `start`/`end`) to read only what you need.
+  - Use `/api/search` options (`regex`, `case`, `context`) to target results and include helpful context.
   - Keep changes in the workspace; respect ignore rules.
 - Don’t:
   - Run arbitrary commands; only `npm test` is supported via `/api/run`.
   - Write into `.git/`, `node_modules/`, or outside the workspace root.
   - Commit or push secrets. `.env` must not be committed.
 
+Quick examples (PowerShell / WSL)
+- Read head: `curl "http://localhost:7080/api/file?path=server.js&head=2000"`
+- Regex search with context: `curl "http://localhost:7080/api/search?q=^POST%20/api/patch&regex=1&case=sensitive&context=1"`
+- Apply diff: POST to `/api/patch/diff` with body `{ diff, keepRegions: true }` (unified diff with `--- a/` / `+++ b/` and `@@` hunks).
+
 Windows Notes
 - The author primarily uses PowerShell. Prefer PowerShell command examples; include WSL/Linux variants when helpful.
 - WSL is available if a Linux-only command is more ergonomic.
 
+Permissions & Quick Commands
+- On first load, ViBE prompts for workspace permissions (read/write/test). You can adjust anytime via the “Permissions” button in the header.
+- Quick slash commands in chat:
+  - `/tree [path]` — list files (depth 2)
+  - `/file <path>` — read a file head
+  - `/search <term>` — search with context
+  - `/help`, `/perms`, `/stats`
+
 Contact
 - If something is unclear for agents, add a short note here or in a `demos/README.md` co-located with examples.
-

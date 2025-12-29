@@ -23,11 +23,25 @@ const btnModeV7 = qs('#btnModeV7');
 const btnAutopilot = qs('#btnAutopilot');
 const workspaceInfoEl = qs('#workspaceInfo');
 const btnChangeWorkspace = qs('#btnChangeWorkspace');
+const btnHelp = qs('#btnHelp');
+const permBanner = qs('#permBanner');
 const wsModal = qs('#wsModal');
 const wsClose = qs('#wsClose');
 const wsCopy = qs('#wsCopy');
 const wsCommand = qs('#wsCommand');
 const wsCurrent = qs('#wsCurrent');
+const helpModal = qs('#helpModal');
+const helpClose = qs('#helpClose');
+const helpBody = qs('#helpBody');
+const btnPerms = qs('#btnPerms');
+const permModal = qs('#permModal');
+const permClose = qs('#permClose');
+const permRead = qs('#permRead');
+const permWrite = qs('#permWrite');
+const permTest = qs('#permTest');
+const permSave = qs('#permSave');
+const permGrantAll = qs('#permGrantAll');
+const permDenyAll = qs('#permDenyAll');
 const gitTagEl = qs('#gitTag');
 const btnCopyBranch = qs('#btnCopyBranch');
 // Dev Tools
@@ -40,6 +54,10 @@ const devRefresh = qs('#devRefresh');
 const devTailToggle = qs('#devTailToggle');
 const devKeepStrictToggle = qs('#devKeepStrictToggle');
 const devExecInChatToggle = qs('#devExecInChatToggle');
+const devSnapKeep = qs('#devSnapKeep');
+const devSnapPrune = qs('#devSnapPrune');
+const devSnapList = qs('#devSnapList');
+const devStats = qs('#devStats');
 let devTailTimer = null;
 
 const colPlanned = qs('#col-planned');
@@ -76,6 +94,7 @@ let modalRawFiles = [];
 let keepRegionsStrict = true;
 let noPendingNoticeShown = false;
 let execInChat = false;
+let perms = { read: false, write: false, test: false };
 
 try {
   const pref = localStorage.getItem('vibe.keepStrict');
@@ -83,6 +102,44 @@ try {
   const eic = localStorage.getItem('vibe.execInChat');
   execInChat = eic === '1';
 } catch {}
+// Permissions init
+try {
+  const rawPerms = localStorage.getItem('vibe.perms');
+  if (rawPerms) perms = { ...perms, ...JSON.parse(rawPerms) };
+} catch {}
+// Hydrate from server config if no local perms
+(async function hydratePermsFromServer() {
+  try {
+    const local = localStorage.getItem('vibe.perms');
+    if (local) return;
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const data = await res.json();
+    const cfg = data && data.config || {};
+    if (cfg.perms && typeof cfg.perms === 'object') {
+      perms = { ...perms, ...cfg.perms };
+      try { localStorage.setItem('vibe.perms', JSON.stringify(perms)); } catch {}
+    }
+  } catch {}
+})();
+function savePerms() { try { localStorage.setItem('vibe.perms', JSON.stringify(perms)); } catch {} }
+function openPermsModal() {
+  try {
+    if (permRead) permRead.checked = !!perms.read;
+    if (permWrite) permWrite.checked = !!perms.write;
+    if (permTest) permTest.checked = !!perms.test;
+  } catch {}
+  permModal.classList.remove('hidden');
+  permModal.setAttribute('aria-hidden', 'false');
+}
+function closePermsModal() { permModal.classList.add('hidden'); permModal.setAttribute('aria-hidden', 'true'); }
+btnPerms?.addEventListener('click', openPermsModal);
+permClose?.addEventListener('click', closePermsModal);
+permSave?.addEventListener('click', () => {
+  perms.read = !!permRead.checked; perms.write = !!permWrite.checked; perms.test = !!permTest.checked; savePerms(); closePermsModal(); addMessage({ who:'system', text: 'Permissions updated.' });
+});
+permGrantAll?.addEventListener('click', () => { if (permRead) permRead.checked = true; if (permWrite) permWrite.checked = true; if (permTest) permTest.checked = true; });
+permDenyAll?.addEventListener('click', () => { if (permRead) permRead.checked = false; if (permWrite) permWrite.checked = false; if (permTest) permTest.checked = false; });
 function startStatus(text) {
   if (!kanbanStatusEl) return;
   statusStart = Date.now();
@@ -928,6 +985,50 @@ chatForm.addEventListener('submit', (e) => {
   const text = chatText.value.trim();
   if (!text) return;
   chatText.value = '';
+  // Slash commands become model hints (no direct tool execution)
+  if (text.startsWith('/')) {
+    const [cmd, ...rest] = text.split(/\s+/);
+    const arg = rest.join(' ').trim();
+    let hint = '';
+    if (cmd === '/help') { openHelpModal(); return; }
+    if (cmd === '/perms') { openPermsModal(); return; }
+    if (cmd === '/stats') { openDevModal(); return; }
+    if (cmd === '/tree') hint = `List files via READ_TREE { dir: "${arg||'.'}", depth: 2 }`;
+    if (cmd === '/file') hint = `Open file via READ_FILE { path: "${arg||'README.md'}" }`;
+    if (cmd === '/search') hint = `Search via SEARCH { q: "${arg||'TODO'}", dir: ".", context: 1 }`;
+    addMessage({ who: 'user', text });
+    v7Chat(hint || text);
+    return;
+  }
+  // No natural-language routing; delegate intent to the model
+  // Global slash commands (quick tools)
+  if (text.startsWith('/')) {
+    const [cmd, ...rest] = text.split(/\s+/);
+    const arg = rest.join(' ').trim();
+    if (cmd === '/help') { openHelpModal(); return; }
+    if (cmd === '/perms') { openPermsModal(); return; }
+    if (cmd === '/stats') { openDevModal(); return; }
+    if (cmd === '/tree') {
+      if (!perms.read) { addMessage({ who:'agent', text:'Read permission is disabled. Click Permissions to enable.' }); return; }
+      (async () => { const depth = 2; const root = arg || '.'; try { const data = await apiJson(`/api/tree?path=${encodeURIComponent(root)}&depth=${depth}`); const lines = data.entries.map(e => `${e.type==='dir'?'📁':'📄'} ${e.path}${e.type==='file'?` (${e.size}b)`:''}`); addMessage({ who:'agent', text: [`# Repo Tree (${data.root}, depth=${data.depth})`, ...lines.slice(0,200)].join('\n') }); } catch (err) { addMessage({ who:'agent', text:`Unable to read tree: ${String(err)}` }); }})();
+      return;
+    }
+    if (cmd === '/file') {
+      if (!perms.read) { addMessage({ who:'agent', text:'Read permission is disabled. Click Permissions to enable.' }); return; }
+      const p = arg || 'README.md';
+      (async () => { try { const data = await apiJson(`/api/file?path=${encodeURIComponent(p)}&head=5000`); addMessage({ who:'agent', text:`# File: ${data.path} (${data.size} bytes)\n\n${data.content}` }); } catch (err) { addMessage({ who:'agent', text:`Unable to read file: ${String(err)}` }); }})();
+      return;
+    }
+    if (cmd === '/search') {
+      if (!perms.read) { addMessage({ who:'agent', text:'Read permission is disabled. Click Permissions to enable.' }); return; }
+      const q = arg || 'TODO';
+      (async () => { try { const data = await apiJson(`/api/search?q=${encodeURIComponent(q)}&max=50&context=1`); const lines = data.matches.map(m => `${m.path}:${m.line}: ${m.text}`); addMessage({ who:'agent', text:[`# Search: ${data.q}`, ...lines.slice(0,200)].join('\n') }); } catch (err) { addMessage({ who:'agent', text:`Unable to search: ${String(err)}` }); }})();
+      return;
+    }
+    // Unknown slash command
+    addMessage({ who:'agent', text:'Unknown command. Try /help, /perms, /tree, /file, /search, /stats' });
+    return;
+  }
   if (mode === 'V0') {
     if (v0RunStarted) {
       addMessage({ who: 'user', text });
@@ -1006,6 +1107,8 @@ chatForm.addEventListener('submit', (e) => {
 
 // Initial boot: default to latest version
 setMode(LATEST_MODE);
+// Show permissions prompt on first load if not set
+(function initPermsOnce(){ try { const raw = localStorage.getItem('vibe.perms'); if (!raw) { setTimeout(openPermsModal, 300); } } catch {} })();
 try { subtitleEl.textContent = 'Latest — Real Planning + Controlled Execution'; } catch {}
 // Fetch and display workspace root
 ;(async () => {
@@ -1051,11 +1154,54 @@ wsClose?.addEventListener('click', closeWsModal);
 wsModal?.addEventListener('click', (e) => { if (e.target && e.target.getAttribute('data-close')) closeWsModal(); });
 wsCopy?.addEventListener('click', async () => { try { await navigator.clipboard.writeText(wsCommand.textContent || ''); } catch {} });
 
+// Help modal controls
+function openHelpModal() {
+  try { helpBody.textContent = buildHelpText(); } catch { helpBody.textContent = 'Help unavailable.'; }
+  helpModal.classList.remove('hidden');
+  helpModal.setAttribute('aria-hidden', 'false');
+}
+function closeHelpModal() {
+  helpModal.classList.add('hidden');
+  helpModal.setAttribute('aria-hidden', 'true');
+}
+btnHelp?.addEventListener('click', openHelpModal);
+helpClose?.addEventListener('click', closeHelpModal);
+helpModal?.addEventListener('click', (e) => { if (e.target && e.target.getAttribute('data-close')) closeHelpModal(); });
+
+function buildHelpText() {
+  const parts = [];
+  parts.push('# ViBE Help & Endpoint Cheatsheet');
+  parts.push('');
+  parts.push('Endpoints:');
+  parts.push('- GET /api/file?path=...&head=2000 — read first N bytes');
+  parts.push('- GET /api/file?path=...&tail=2000 — read last N bytes');
+  parts.push('- GET /api/file?path=...&start=0&end=5000 — byte range');
+  parts.push('- GET /api/search?q=term&context=2 — search with ±N lines');
+  parts.push('- GET /api/search?q=^POST%20/api/patch&regex=1&case=sensitive — regex search');
+  parts.push('- POST /api/patch/diff { diff, keepRegions?, preview? } — apply unified diffs');
+  parts.push('- POST /api/revert { snapshotId, direction } — revert/reapply');
+  parts.push('- GET /api/snapshots/list — list snapshots');
+  parts.push('- POST /api/snapshots/prune { keep } — prune old snapshots');
+  parts.push('- GET /api/stats — tool-call counters');
+  parts.push('');
+  parts.push('PowerShell examples:');
+  parts.push('- curl "http://localhost:7080/api/file?path=server.js&head=2000"');
+  parts.push('- curl "http://localhost:7080/api/search?q=wrapup&context=2"');
+  parts.push('- curl "http://localhost:7080/api/search?q=^POST%20/api/patch&regex=1&case=sensitive&context=1"');
+  parts.push('');
+  parts.push('WSL/Linux examples:');
+  parts.push("- curl 'http://localhost:7080/api/file?path=README.md&tail=1500'");
+  parts.push("- curl 'http://localhost:7080/api/search?q=revert&context=2'");
+  return parts.join('\n');
+}
+
 // Dev Tools modal controls
 function openDevModal() {
   devModal.classList.remove('hidden');
   devModal.setAttribute('aria-hidden', 'false');
   fetchDebugLogs();
+  fetchStats();
+  fetchSnapshots();
   if (devTailToggle?.checked) startDevTail();
   if (devKeepStrictToggle) devKeepStrictToggle.checked = !!keepRegionsStrict;
   if (devExecInChatToggle) devExecInChatToggle.checked = !!execInChat;
@@ -1078,6 +1224,8 @@ btnDevTools?.addEventListener('click', openDevModal);
 devClose?.addEventListener('click', closeDevModal);
 devModal?.addEventListener('click', (e) => { if (e.target && e.target.getAttribute('data-close')) closeDevModal(); });
 devRefresh?.addEventListener('click', fetchDebugLogs);
+devRefresh?.addEventListener('click', fetchSnapshots);
+devRefresh?.addEventListener('click', fetchStats);
 devCopy?.addEventListener('click', async () => { try { await navigator.clipboard.writeText(devBody.textContent || ''); } catch {} });
 devTailToggle?.addEventListener('change', () => { if (devTailToggle.checked) startDevTail(); else stopDevTail(); });
 devKeepStrictToggle?.addEventListener('change', () => {
@@ -1089,12 +1237,51 @@ devExecInChatToggle?.addEventListener('change', () => {
   try { localStorage.setItem('vibe.execInChat', execInChat ? '1' : '0'); } catch {}
 });
 
+async function fetchSnapshots() {
+  if (!devSnapList) return;
+  try {
+    const data = await apiJson('/api/snapshots/list');
+    const snaps = Array.isArray(data.snapshots) ? data.snapshots : [];
+    const lines = snaps.map(s => `${s.id}  \t${new Date(s.mtimeMs || 0).toISOString()}`);
+    devSnapList.textContent = lines.length ? lines.join('\n') : '(none)';
+  } catch (e) {
+    devSnapList.textContent = `Error loading snapshots: ${String(e)}`;
+  }
+}
+devSnapPrune?.addEventListener('click', async () => {
+  const keep = Math.max(0, Number(devSnapKeep?.value || 0));
+  try {
+    await apiPost('/api/snapshots/prune', { keep });
+    await fetchSnapshots();
+  } catch (e) {
+    addMessage({ who: 'system', text: `Snapshot prune error: ${String(e)}` });
+  }
+});
+
 function startDevTail() {
   stopDevTail();
   devTailTimer = setInterval(fetchDebugLogs, 1500);
 }
 function stopDevTail() {
   if (devTailTimer) { clearInterval(devTailTimer); devTailTimer = null; }
+}
+
+async function fetchStats() {
+  if (!devStats) return;
+  try {
+    const s = await apiJson('/api/stats');
+    const t = s.tests || { ok: 0, fail: 0 };
+    const p = s.patches || { count: 0, files: 0 };
+    const bits = [];
+    bits.push(`Events: ${s.totalEvents || 0}`);
+    bits.push(`Patches: ${p.count || 0}`);
+    bits.push(`Files: ${p.files || 0}`);
+    bits.push(`Tests: ok=${t.ok||0} fail=${t.fail||0}`);
+    if (Array.isArray(s.recentFiles) && s.recentFiles.length) bits.push(`Recent: ${s.recentFiles.slice(0,3).join(', ')}`);
+    devStats.textContent = bits.join('  |  ');
+  } catch (e) {
+    devStats.textContent = `Stats unavailable: ${String(e)}`;
+  }
 }
 
 // ========== V2 Agent (read-only tools) ==========
@@ -1115,11 +1302,32 @@ async function v7Chat(text) {
     const shouldSpeak = isAsk || (!isPlanOrProceed && !hasToolWrites) || isQuestion;
     if (shouldSpeak) addMessage({ who: 'agent', text: message });
     if (!actions.length) {
-      messageOnlyTurns += 1;
-      if (kanbanStatusEl && messageOnlyTurns >= 2) { stopStatus(); kanbanStatusEl.textContent = 'Waiting for agent actions…'; }
+      // Explicit Needs Input state without auto-creating a card
+      stopStatus();
+      if (kanbanStatusEl) kanbanStatusEl.textContent = 'Waiting for your instruction…';
+      try {
+        // If there is an active task, mark it as NEEDS_INPUT
+        const active = (plan?.tasks || []).find(t => t.status === STATUS.EXECUTING || t.status === STATUS.VERIFYING);
+        if (active) { active.status = STATUS.NEEDS_INPUT; v1NormalizeTasksFromPlan(); renderPlanJson(); updateEvidence(active.taskId, STATUS.NEEDS_INPUT); }
+      } catch {}
     } else {
       messageOnlyTurns = 0;
       if (kanbanStatusEl) { kanbanStatusEl.textContent = ''; stopStatus(); }
+      // Show permission banner if server gated execution
+      try {
+        const halt = actions.find(a => a && a.type === 'HALT_EXECUTION' && (a.reason === 'PERMISSION_REQUIRED'));
+        if (halt && permBanner) {
+          const missing = Array.isArray(halt.missing) ? halt.missing : [];
+          const need = missing.length ? missing.join(' & ') : 'permissions';
+          permBanner.textContent = `Execution paused — enable ${need}`;
+          permBanner.style.display = 'inline-block';
+          // Auto-hide after next permission change
+          const hide = () => { permBanner.style.display = 'none'; };
+          devKeepStrictToggle?.addEventListener('change', hide, { once: true });
+        } else if (permBanner) {
+          permBanner.style.display = 'none';
+        }
+      } catch {}
     }
     for (const a of actions) {
       if (!a || !a.type) continue;
@@ -1335,7 +1543,7 @@ function addExecutionSummary(patchRes, runRes, task) {
 function buildClientState() {
   const pendingCount = (plan?.tasks || []).filter(t => t.status !== STATUS.DONE).length;
   const activeDir = guessActiveDirFromPlan(plan) || null;
-  return { pendingCount, activeDir, autopilot: v5Autopilot };
+  return { pendingCount, activeDir, autopilot: v5Autopilot, perms: { read: !!perms.read, write: !!perms.write, test: !!perms.test } };
 }
 
 function guessActiveDirFromPlan(p) {
@@ -1584,6 +1792,12 @@ async function latestRunQueue() {
   const t = queue[0];
   v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.EXECUTING, notes: 'Applying patch' });
   startStatus('Applying patch…');
+  if (!perms.write) {
+    v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED, notes: 'Write permission required' });
+    stopStatus();
+    addMessage({ who:'system', text:'✋ Write permission is disabled. Click Permissions to enable writes, then continue.' });
+    return;
+  }
   let patchRes;
   try {
     patchRes = await latestApplyPatchForTask(t);
@@ -1609,6 +1823,7 @@ async function latestRunQueue() {
   }
   try {
     startStatus('Running tests…');
+    if (!perms.test) { throw new Error('Tests require permission'); }
     const runRes = await apiPost('/api/run', { kind: 'test', timeoutMs: 15000 });
     const ok = !!runRes.ok;
     v3Evidence[t.taskId] = { diff: v3Evidence[t.taskId]?.diff || '', logs: `tests: ${ok ? 'ok' : 'fail'}\n${(runRes.stdout || '').slice(0, 2000)}`, tests: (runRes.stdout || '').slice(0, 4000), files: v3Evidence[t.taskId]?.files || [] };
@@ -1628,9 +1843,10 @@ async function latestRunQueue() {
       addExecutionSummary(patchRes, runRes, t); // always show on failure
     }
   } catch (e) {
-    v3Evidence[t.taskId] = { diff: v3Evidence[t.taskId]?.diff || '', logs: 'Error running tests', tests: String(e), files: v3Evidence[t.taskId]?.files || [] };
-    v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED });
-    if (kanbanStatusEl) { kanbanStatusEl.textContent = 'Error running tests'; stopStatus(); }
+    const msg = String(e||'');
+    v3Evidence[t.taskId] = { diff: v3Evidence[t.taskId]?.diff || '', logs: msg.includes('permission') ? 'tests: permission required' : 'Error running tests', tests: String(e), files: v3Evidence[t.taskId]?.files || [] };
+    v3Dispatch({ action: 'UPDATE_TASK', taskId: t.taskId, status: STATUS.BLOCKED, notes: msg.includes('permission') ? 'Tests permission required' : 'Tests error' });
+    if (kanbanStatusEl) { kanbanStatusEl.textContent = msg.includes('permission') ? 'Tests require permission' : 'Error running tests'; stopStatus(); }
     addExecutionSummary(patchRes, { ok: false, stdout: String(e) }, t);
   }
 }
@@ -2277,6 +2493,7 @@ async function v5ApplyPatchForTask(task) {
 }
 // V6 memory cache
 let v6Events = [];
+let v6Stats = null;
 
 async function v6Log(type, data) {
   try { await apiPost('/api/event', { type, data }); } catch {}
@@ -2287,6 +2504,7 @@ async function v6FetchAndRender() {
     const out = await apiJson('/api/events');
     v6Events = Array.isArray(out.events) ? out.events : [];
   } catch { v6Events = []; }
+  try { v6Stats = await apiJson('/api/stats'); } catch { v6Stats = null; }
   renderMemory();
 }
 
@@ -2317,6 +2535,19 @@ function renderMemory() {
   const checks = v6Events.filter(e => e.type === 'REVERT_CHECK').length;
   lines.push(`Reverts: ${revs}`);
   lines.push(`Revert checks: ${checks}`);
+  if (v6Stats && v6Stats.ok) {
+    lines.push('');
+    lines.push(`# Agent Stats`);
+    const c = v6Stats.counts || {};
+    lines.push(`Events: ${v6Stats.totalEvents || 0}`);
+    lines.push(`Patches: ${(v6Stats.patches && v6Stats.patches.count) || 0} (files ${(v6Stats.patches && v6Stats.patches.files) || 0})`);
+    const t = v6Stats.tests || { ok: 0, fail: 0 };
+    lines.push(`Tests: ok=${t.ok||0} fail=${t.fail||0}`);
+    if (Array.isArray(v6Stats.recentFiles) && v6Stats.recentFiles.length) {
+      lines.push(`Recent files: ${v6Stats.recentFiles.slice(0,5).join(', ')}`);
+    }
+    lines.push(`Snapshots: ${v6Stats.snapshots || 0}`);
+  }
   lines.push('');
   lines.push(`# Recent Events`);
   const recent = v6Events.slice(-20);
@@ -2334,5 +2565,32 @@ function renderMemory() {
   }
   tabMemory.textContent = lines.join('\n');
 }
+
+// Optional: quick endpoint cheat sheet appended after first render
+try {
+  const orig = renderMemory;
+  renderMemory = function() {
+    orig();
+    if (!tabMemory) return;
+    const extra = [
+      '',
+      '# Endpoint Cheatsheet',
+      '- GET /api/file?path=...&head=2000 — read first N bytes',
+      '- GET /api/file?path=...&tail=2000 — read last N bytes',
+      '- GET /api/file?path=...&start=0&end=5000 — byte range',
+      '- GET /api/search?q=term&context=2 — search with ±N lines',
+      '- GET /api/search?q=^POST%20/api/patch&regex=1&case=sensitive — regex',
+      '- POST /api/patch/diff { diff, keepRegions } — apply unified diff',
+      '- POST /api/revert { snapshotId, direction } — revert or reapply',
+      '- GET /api/stats — tool call counters'
+    ].join('\n');
+    // Append only once per load
+    if (!renderMemory._cheats) {
+      tabMemory.textContent = tabMemory.textContent + '\n' + extra;
+      renderMemory._cheats = true;
+    }
+  }
+} catch {}
 let lastTabClickTs = 0;
 let lastSelectedTab = 'diff';
+// (Removed natural-language router and adhoc task creators; model must drive tool calls)

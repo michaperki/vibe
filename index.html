@@ -13,10 +13,13 @@
       <div class="workspace-info" id="workspaceInfo" title="Workspace root"></div>
       <span id="gitTag" class="tiny-tag" title="Git integration state"></span>
       <button id="btnCopyBranch" class="reset-btn" title="Copy Git branch">Copy Branch</button>
+      <div id="permBanner" class="tiny-tag" style="margin-left:8px; background:#d97706; color:#0b0b0b; display:none;" title="Permissions required"></div>
       <div class="controls">
         <div class="mode-toggle" aria-label="Mode"></div>
         <button id="btnAutopilot" class="auto-btn" title="Autopilot toggles agent pacing">Autopilot: On</button>
         <button id="btnDevTools" class="reset-btn" title="Open developer tools">Dev Tools</button>
+        <button id="btnPerms" class="reset-btn" title="Manage permissions">Permissions</button>
+        <button id="btnHelp" class="reset-btn" title="Open help and endpoints">Help</button>
         <button id="btnChangeWorkspace" class="reset-btn" title="How to change workspace">Change Workspace</button>
         <button id="btnReset" class="reset-btn" title="Reset run">Reset</button>
       </div>
@@ -144,7 +147,61 @@
             <button id="devClose" class="modal-btn" title="Close">Close</button>
           </div>
         </div>
-        <pre id="devBody" class="code" tabindex="0" aria-label="Debug logs" style="max-height:60vh; overflow:auto;"></pre>
+        <div id="devStats" class="code" aria-label="Stats" style="padding:8px 12px; border-bottom:1px solid #1e2a36; color:#9aa7b4; white-space:pre-wrap;"></div>
+        <pre id="devBody" class="code" tabindex="0" aria-label="Debug logs" style="max-height:40vh; overflow:auto;"></pre>
+        <div style="padding:8px 12px; border-top:1px solid #1e2a36; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div style="font-weight:600; color:#9aa7b4;">Snapshots</div>
+          <label style="font-size:12px; color:#9aa7b4; display:flex; align-items:center; gap:6px;">
+            Keep last
+            <input id="devSnapKeep" type="number" min="0" value="10" style="width:64px;" />
+          </label>
+          <button id="devSnapPrune" class="modal-btn" title="Prune snapshots">Prune</button>
+        </div>
+        <pre id="devSnapList" class="code" aria-label="Snapshots" style="max-height:20vh; overflow:auto;"></pre>
+      </div>
+    </div>
+
+    <!-- Help Modal -->
+    <div id="helpModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Help & Endpoints">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Help & Endpoints</div>
+          <div class="modal-actions">
+            <button id="helpClose" class="modal-btn" title="Close">Close</button>
+          </div>
+        </div>
+        <pre id="helpBody" class="code" tabindex="0" aria-label="Help" style="max-height:70vh; overflow:auto;"></pre>
+      </div>
+    </div>
+
+    <!-- Permissions Modal -->
+    <div id="permModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Permissions">
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-dialog" role="document">
+        <div class="modal-header">
+          <div class="modal-title">Permissions</div>
+          <div class="modal-actions">
+            <button id="permClose" class="modal-btn" title="Close">Close</button>
+          </div>
+        </div>
+        <div class="code" style="padding:12px;">
+          <p>Grant the agent access to your workspace actions. You can change these anytime.</p>
+          <label style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+            <input id="permRead" type="checkbox" /> Allow read (list/search/read files)
+          </label>
+          <label style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+            <input id="permWrite" type="checkbox" /> Allow write (apply patches/diffs)
+          </label>
+          <label style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+            <input id="permTest" type="checkbox" /> Allow run tests (`npm test`)
+          </label>
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button id="permSave" class="modal-btn" title="Save permissions">Save</button>
+            <button id="permGrantAll" class="modal-btn" title="Grant all">Grant All</button>
+            <button id="permDenyAll" class="modal-btn" title="Deny all">Deny All</button>
+          </div>
+        </div>
       </div>
     </div>
 

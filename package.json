@@ -1,0 +1,26 @@
+{
+  "name": "@vibelabs/vibe",
+  "version": "0.1.0",
+  "description": "ViBE — Chat-first coding agent demo with Kanban UI and minimal Node server",
+  "bin": {
+    "vibe": "vibe.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "files": [
+    "index.html",
+    "styles.css",
+    "app.js",
+    "server.js",
+    "vibe.js",
+    "AGENTS.md",
+    "README.md"
+  ]
+}
+
